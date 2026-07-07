@@ -124,6 +124,11 @@ func (r *UserRepository) Save(ctx context.Context, user *domain.User) error {
 				"name",
 				"created_at",
 				"updated_at",
+				"two_factor_enabled",
+				"two_factor_secret",
+				"two_factor_recovery_codes",
+				"two_factor_last_used_step",
+				"metadata",
 			).
 			Values(
 				user.Login,
@@ -133,6 +138,11 @@ func (r *UserRepository) Save(ctx context.Context, user *domain.User) error {
 				user.Name,
 				user.CreatedAt,
 				user.UpdatedAt,
+				user.TwoFactorEnabled,
+				user.TwoFactorSecret,
+				user.TwoFactorRecoveryCodes,
+				user.TwoFactorLastUsedStep,
+				user.Metadata,
 			).
 			Suffix("RETURNING id")
 	} else {
@@ -147,6 +157,11 @@ func (r *UserRepository) Save(ctx context.Context, user *domain.User) error {
 				user.Name,
 				user.CreatedAt,
 				user.UpdatedAt,
+				user.TwoFactorEnabled,
+				user.TwoFactorSecret,
+				user.TwoFactorRecoveryCodes,
+				user.TwoFactorLastUsedStep,
+				user.Metadata,
 			).
 			Suffix("ON CONFLICT(id) DO UPDATE SET " +
 				"login=excluded.login," +
@@ -154,7 +169,12 @@ func (r *UserRepository) Save(ctx context.Context, user *domain.User) error {
 				"password=excluded.password," +
 				"remember_token=excluded.remember_token," +
 				"name=excluded.name," +
-				"updated_at=excluded.updated_at " +
+				"updated_at=excluded.updated_at," +
+				"two_factor_enabled=excluded.two_factor_enabled," +
+				"two_factor_secret=excluded.two_factor_secret," +
+				"two_factor_recovery_codes=excluded.two_factor_recovery_codes," +
+				"two_factor_last_used_step=excluded.two_factor_last_used_step," +
+				"metadata=excluded.metadata " +
 				"RETURNING id")
 	}
 
@@ -205,6 +225,11 @@ func (r *UserRepository) scan(row base.Scanner) (*domain.User, error) {
 		&user.Name,
 		&user.CreatedAt,
 		&user.UpdatedAt,
+		&user.TwoFactorEnabled,
+		&user.TwoFactorSecret,
+		&user.TwoFactorRecoveryCodes,
+		&user.TwoFactorLastUsedStep,
+		&user.Metadata,
 	)
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed to scan row")

@@ -35,6 +35,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -119,6 +120,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "admin",
 					Email: "admin@example.com",
+					User:  &domain.User{ID: 1, Login: "admin"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -177,11 +179,24 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			wantError:      "user not authenticated",
 		},
 		{
+			// A session is present in context but carries no authenticated user
+			// (User is nil), so IsAuthenticated() is false and the request must
+			// be rejected just like a missing session.
+			name: "session present but unauthenticated",
+			setupAuth: func() context.Context {
+				return auth.ContextWithSession(context.Background(), &auth.Session{})
+			},
+			setupRepo:      func(_ *inmemory.UserRepository, _ *inmemory.ServerRepository, _ *inmemory.RBACRepository) {},
+			expectedStatus: http.StatusUnauthorized,
+			wantError:      "user not authenticated",
+		},
+		{
 			name: "authenticated user not found in database",
 			setupAuth: func() context.Context {
 				session := &auth.Session{
 					Login: "nonexistent",
 					Email: "nonexistent@example.com",
+					User:  &domain.User{ID: 1, Login: "nonexistent"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -196,6 +211,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "usernoservers",
 					Email: "noservers@example.com",
+					User:  &domain.User{ID: 1, Login: "usernoservers"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -327,6 +343,7 @@ func TestHandler_AdminUserHasAllAbilities(t *testing.T) {
 	session := &auth.Session{
 		Login: "admin",
 		Email: "admin@example.com",
+		User:  &domain.User{ID: 1, Login: "admin"},
 	}
 	ctx := auth.ContextWithSession(context.Background(), session)
 
@@ -410,6 +427,7 @@ func TestHandler_RegularUserAbilities(t *testing.T) {
 	session := &auth.Session{
 		Login: "user",
 		Email: "user@example.com",
+		User:  &domain.User{ID: 1, Login: "user"},
 	}
 	ctx := auth.ContextWithSession(context.Background(), session)
 

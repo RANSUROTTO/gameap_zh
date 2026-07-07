@@ -15,35 +15,36 @@ import (
 	"github.com/gameap/gameap/internal/config"
 	"github.com/gameap/gameap/internal/pubsub/integration"
 	"github.com/gameap/gameap/migrations"
+	"github.com/gameap/gameap/pkg/auth"
 	"github.com/gameap/gameap/pkg/netutil"
+	"github.com/gameap/gameap/pkg/tlsutil"
 	"github.com/pkg/errors"
 )
 
 type RunParams struct {
-	EnvFile       string
-	LegacyEnvFile string
+	EnvFile string
 }
+
+// osExit is a seam over os.Exit so the bootstrap failure paths can be exercised
+// in tests without terminating the test process. Mirrors the detectInterfaceSANs
+// seam in tls_helpers.go.
+var osExit = os.Exit
 
 //nolint:funlen
 func Run(runParams RunParams) {
 	if err := loadEnvFile(runParams.EnvFile); err != nil {
 		slog.Error("Failed to load env file", slog.String("error", err.Error()))
 
-		os.Exit(1)
+		osExit(1)
 
 		return
-	}
-
-	if err := loadLegacyEnv(runParams.LegacyEnvFile); err != nil {
-		// Log the error but continue execution
-		slog.Error("Failed to load legacy env file", slog.String("error", err.Error()))
 	}
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		slog.Error("Failed to load config", slog.String("error", err.Error()))
 
-		os.Exit(1)
+		osExit(1)
 
 		return
 	}
@@ -73,6 +74,27 @@ func Run(runParams RunParams) {
 	container := NewContainer(cfg)
 	container.SetContext(ctx, cancel)
 
+	// Install the process-wide password policy state used by
+	// auth.ValidatePassword (ASVS §2.1.7 common-password blocklist + the
+	// AUTH_ALLOW_WEAK_PASSWORDS operator override). The Container accessor
+	// emits the warn/info/error logs; we wire the resulting blocklist into
+	// the pkg/auth singleton so every handler input.Validate() sees it.
+	auth.SetAllowWeakPasswords(cfg.Auth.AllowWeakPasswords)
+	auth.SetPasswordBlocklist(container.PasswordBlocklist())
+
+	// Install the operator-chosen bcrypt cost (ASVS §2.4.4). A configured
+	// value outside [auth.MinBcryptCost, auth.MaxBcryptCost] is rejected at
+	// boot rather than silently falling back, so a misconfiguration cannot
+	// ship a weaker default than the project floor.
+	if err := auth.SetDefaultBcryptCost(cfg.Auth.BcryptCost); err != nil {
+		slog.Error("invalid AUTH_BCRYPT_COST", slog.Int("cost", cfg.Auth.BcryptCost), slog.String("error", err.Error()))
+		osExit(1)
+
+		return
+	}
+	slog.Info("password hashing configured",
+		slog.Int("bcrypt_cost", auth.ActiveBcryptCost()))
+
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -98,7 +120,7 @@ func Run(runParams RunParams) {
 			slog.String("error", err.Error()),
 		)
 
-		os.Exit(1)
+		osExit(1)
 
 		return
 	}
@@ -111,7 +133,7 @@ func Run(runParams RunParams) {
 			slog.String("error", err.Error()),
 		)
 
-		os.Exit(1)
+		osExit(1)
 
 		return
 	}
@@ -127,40 +149,23 @@ func Run(runParams RunParams) {
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to load plugins", slog.String("error", err.Error()))
 
-		os.Exit(1)
+		osExit(1)
 	}
 
 	err = container.PluginDispatcher().RefreshSubscriptions(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to refresh plugin subscriptions", slog.String("error", err.Error()))
 
-		os.Exit(1)
+		osExit(1)
 	}
 
 	startPubSub(ctx, container)
 
 	startUploadJanitor(ctx, container)
 
-	if cfg.GRPC.Enabled {
-		runWithGRPC(ctx, cfg, container)
-	} else {
-		slog.WarnContext(ctx, "Running in legacy HTTP-only mode. "+
-			"To enable gRPC bidirectional streaming, set the following environment variables: "+
-			"GRPC_ENABLED=true, GRPC_PORT (default: 31718), GRPC_TLS_ENABLED (default: true). "+
-			"See documentation for details: https://docs.gameap.com/grpc_setup.html",
-		)
-		runHTTPOnly(ctx, cfg, container)
-	}
+	runWithGRPC(ctx, cfg, container)
 
 	<-shutdownDone
-}
-
-func runHTTPOnly(ctx context.Context, cfg *config.Config, container *Container) {
-	startHTTPListener(ctx, cfg, container)
-
-	if cfg.TLSEnabled() {
-		startHTTPSServer(ctx, cfg, container)
-	}
 }
 
 // startHTTPListener binds the plain-HTTP listener and starts serving on it
@@ -181,7 +186,7 @@ func startHTTPListener(ctx context.Context, cfg *config.Config, container *Conta
 			slog.String("error", err.Error()),
 		)
 
-		os.Exit(1)
+		osExit(1)
 	}
 
 	go func() {
@@ -196,7 +201,7 @@ func startHTTPListener(ctx context.Context, cfg *config.Config, container *Conta
 func runWithGRPC(ctx context.Context, cfg *config.Config, container *Container) {
 	if err := container.SessionRegistry().Start(ctx); err != nil {
 		slog.ErrorContext(ctx, "Failed to start session registry", slog.String("error", err.Error()))
-		os.Exit(1)
+		osExit(1)
 	}
 
 	if err := container.FileDispatcher().Start(ctx); err != nil {
@@ -230,7 +235,7 @@ func runWithGRPC(ctx context.Context, cfg *config.Config, container *Container) 
 	grpcServer, err := container.GRPCServer()
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to create gRPC server", slog.String("error", err.Error()))
-		os.Exit(1)
+		osExit(1)
 	}
 
 	grpcAddr := net.JoinHostPort(cfg.HTTPBindIP, strconv.Itoa(int(cfg.GRPC.Port)))
@@ -238,7 +243,7 @@ func runWithGRPC(ctx context.Context, cfg *config.Config, container *Container) 
 	lis, err := new(net.ListenConfig).Listen(ctx, "tcp", grpcAddr)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to listen for gRPC", slog.String("error", err.Error()))
-		os.Exit(1)
+		osExit(1)
 	}
 
 	go func() {
@@ -270,16 +275,15 @@ func startHTTPSServer(ctx context.Context, cfg *config.Config, container *Contai
 			slog.String("error", err.Error()),
 		)
 
-		os.Exit(1)
+		osExit(1)
 
 		return
 	}
 
 	httpsServer := container.HTTPSServer()
-	httpsServer.TLSConfig = &tls.Config{
+	httpsServer.TLSConfig = tlsutil.HardenServerConfig(&tls.Config{
 		GetCertificate: getCert,
-		MinVersion:     tls.VersionTLS12,
-	}
+	})
 
 	go func() {
 		slog.InfoContext(ctx, "Starting HTTPS server",

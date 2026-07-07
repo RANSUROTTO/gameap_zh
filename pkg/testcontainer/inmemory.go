@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/gameap/gameap/internal/acme"
+	"github.com/gameap/gameap/internal/api/filemanager/filemanagermime"
+	"github.com/gameap/gameap/internal/audit"
 	"github.com/gameap/gameap/internal/cache"
 	"github.com/gameap/gameap/internal/certificates"
 	"github.com/gameap/gameap/internal/config"
@@ -24,13 +26,16 @@ import (
 	"github.com/gameap/gameap/internal/repositories/base"
 	"github.com/gameap/gameap/internal/repositories/inmemory"
 	"github.com/gameap/gameap/internal/services"
+	"github.com/gameap/gameap/internal/services/captcha"
 	"github.com/gameap/gameap/internal/services/filemanager/archiver"
 	"github.com/gameap/gameap/internal/services/gameapimporter"
 	"github.com/gameap/gameap/internal/services/gameexporter"
+	"github.com/gameap/gameap/internal/services/mfanudge"
 	"github.com/gameap/gameap/internal/services/pelicaneggimporter"
 	"github.com/gameap/gameap/internal/services/pluginstore"
 	"github.com/gameap/gameap/internal/services/serverconfigpush"
 	"github.com/gameap/gameap/internal/services/servercontrol"
+	"github.com/gameap/gameap/internal/services/servertaskdispatcher"
 	"github.com/gameap/gameap/internal/services/taskdispatcher"
 	"github.com/gameap/gameap/internal/upload"
 	"github.com/gameap/gameap/internal/ws"
@@ -39,37 +44,41 @@ import (
 	"github.com/gameap/gameap/pkg/plugin"
 	"github.com/gameap/gameap/pkg/secret"
 	pkgstrings "github.com/gameap/gameap/pkg/strings"
+	"github.com/gameap/gameap/pkg/twofactor"
 	"github.com/samber/lo"
 )
 
 type InmemoryContainer struct {
-	cfg                   *config.Config
-	responder             *pkgapi.Responder
-	gameRepo              repositories.GameRepository
-	gameModRepo           repositories.GameModRepository
-	serverRepo            repositories.ServerRepository
-	userRepo              repositories.UserRepository
-	authService           auth.Service
-	userService           *services.UserService
-	rbacRepo              repositories.RBACRepository
-	tokenRepo             repositories.PersonalAccessTokenRepository
-	daemonTaskRepo        repositories.DaemonTaskRepository
-	serverTaskRepo        repositories.ServerTaskRepository
-	serverTaskFailRepo    repositories.ServerTaskFailRepository
-	serverSettingRepo     repositories.ServerSettingRepository
-	nodeRepo              repositories.NodeRepository
-	clientCertificateRepo repositories.ClientCertificateRepository
-	rbacService           *rbac.RBAC
-	serverControlService  *servercontrol.Service
-	gameUpgradeService    *services.GameUpgradeService
-	fileManager           files.FileManager
-	cacheService          cache.Cache
-	certificatesService   *certificates.Service
-	globalAPIService      *services.GlobalAPIService
-	daemonStatusService   *daemon.StatusService
-	daemonFilesService    *daemon.FileService
-	daemonCommandsService *daemon.CommandService
-	uploadSessionService  *upload.Service
+	cfg                     *config.Config
+	responder               *pkgapi.Responder
+	gameRepo                repositories.GameRepository
+	gameModRepo             repositories.GameModRepository
+	serverRepo              repositories.ServerRepository
+	userRepo                repositories.UserRepository
+	authService             auth.Service
+	twoFactorManager        *twofactor.Manager
+	userService             *services.UserService
+	mfaNudgeService         *mfanudge.Service
+	rbacRepo                repositories.RBACRepository
+	tokenRepo               repositories.PersonalAccessTokenRepository
+	daemonTaskRepo          repositories.DaemonTaskRepository
+	serverTaskRepo          repositories.ServerTaskRepository
+	serverTaskExecutionRepo repositories.ServerTaskExecutionRepository
+	serverSettingRepo       repositories.ServerSettingRepository
+	nodeRepo                repositories.NodeRepository
+	clientCertificateRepo   repositories.ClientCertificateRepository
+	rbacService             *rbac.RBAC
+	serverControlService    *servercontrol.Service
+	gameUpgradeService      *services.GameUpgradeService
+	fileManager             files.FileManager
+	cacheService            cache.Cache
+	certificatesService     *certificates.Service
+	globalAPIService        *services.GlobalAPIService
+	daemonStatusService     *daemon.StatusService
+	daemonFilesService      *daemon.FileService
+	daemonCommandsService   *daemon.CommandService
+	uploadSessionService    *upload.Service
+	auditLogger             audit.Logger
 }
 
 func (c *InmemoryContainer) Config() *config.Config                            { return c.cfg }
@@ -82,7 +91,15 @@ func (c *InmemoryContainer) GameModRepository() repositories.GameModRepository {
 func (c *InmemoryContainer) ServerRepository() repositories.ServerRepository   { return c.serverRepo }
 func (c *InmemoryContainer) UserRepository() repositories.UserRepository       { return c.userRepo }
 func (c *InmemoryContainer) AuthService() auth.Service                         { return c.authService }
+func (c *InmemoryContainer) TwoFactorManager() *twofactor.Manager              { return c.twoFactorManager }
 func (c *InmemoryContainer) UserService() *services.UserService                { return c.userService }
+func (c *InmemoryContainer) MFANudgeService() *mfanudge.Service {
+	if c.mfaNudgeService == nil {
+		c.mfaNudgeService = mfanudge.New(*c.cfg, nil)
+	}
+
+	return c.mfaNudgeService
+}
 func (c *InmemoryContainer) ServerControlService() *servercontrol.Service {
 	return c.serverControlService
 }
@@ -99,8 +116,8 @@ func (c *InmemoryContainer) DaemonTaskRepository() repositories.DaemonTaskReposi
 func (c *InmemoryContainer) ServerTaskRepository() repositories.ServerTaskRepository {
 	return c.serverTaskRepo
 }
-func (c *InmemoryContainer) ServerTaskFailRepository() repositories.ServerTaskFailRepository {
-	return c.serverTaskFailRepo
+func (c *InmemoryContainer) ServerTaskExecutionRepository() repositories.ServerTaskExecutionRepository {
+	return c.serverTaskExecutionRepo
 }
 func (c *InmemoryContainer) ServerSettingRepository() repositories.ServerSettingRepository {
 	return c.serverSettingRepo
@@ -114,10 +131,13 @@ func (c *InmemoryContainer) FileManager() files.FileManager               { retu
 func (c *InmemoryContainer) Cache() cache.Cache                           { return c.cacheService }
 func (c *InmemoryContainer) CertificatesService() *certificates.Service   { return c.certificatesService }
 func (c *InmemoryContainer) GlobalAPIService() *services.GlobalAPIService { return c.globalAPIService }
-func (c *InmemoryContainer) DaemonStatus() *daemon.StatusService          { return c.daemonStatusService }
-func (c *InmemoryContainer) DaemonFiles() *daemon.FileService             { return c.daemonFilesService }
-func (c *InmemoryContainer) UploadSessionService() *upload.Service        { return c.uploadSessionService }
-func (c *InmemoryContainer) FileManagerArchiver() *archiver.Archiver      { return nil }
+func (c *InmemoryContainer) CaptchaVerifier() *captcha.Service {
+	return captcha.NewService(captcha.Config{})
+}
+func (c *InmemoryContainer) DaemonStatus() *daemon.StatusService     { return c.daemonStatusService }
+func (c *InmemoryContainer) DaemonFiles() *daemon.FileService        { return c.daemonFilesService }
+func (c *InmemoryContainer) UploadSessionService() *upload.Service   { return c.uploadSessionService }
+func (c *InmemoryContainer) FileManagerArchiver() *archiver.Archiver { return nil }
 func (c *InmemoryContainer) FileManagerArchiveGuard() *archiver.InMemoryConcurrencyGuard {
 	return archiver.NewInMemoryConcurrencyGuard(2)
 }
@@ -134,14 +154,45 @@ func (c *InmemoryContainer) PelicanEggImporter() *pelicaneggimporter.Importer { 
 func (c *InmemoryContainer) GameAPImporter() *gameapimporter.Importer         { return nil }
 func (c *InmemoryContainer) GameExporter() *gameexporter.Exporter             { return nil }
 func (c *InmemoryContainer) TaskDispatcher() *taskdispatcher.Dispatcher       { return nil }
-func (c *InmemoryContainer) ServerConfigPusher() *serverconfigpush.Pusher     { return nil }
-func (c *InmemoryContainer) WSHub() *ws.Hub                                   { return ws.NewHub(nil) }
-func (c *InmemoryContainer) SessionRegistry() *session.Registry               { return nil }
-func (c *InmemoryContainer) CommandHandler() *grpchandlers.CommandHandler     { return nil }
-func (c *InmemoryContainer) AttachHandler() *grpchandlers.AttachHandler       { return nil }
-func (c *InmemoryContainer) MetricsHub() metrics.Hub                          { return nil }
-func (c *InmemoryContainer) PubSub() pubsub.PubSub                            { return nil }
-func (c *InmemoryContainer) ACMEService() *acme.Service                       { return nil }
+func (c *InmemoryContainer) ServerTaskDispatcher() *servertaskdispatcher.Dispatcher {
+	return nil
+}
+func (c *InmemoryContainer) ServerConfigPusher() *serverconfigpush.Pusher { return nil }
+func (c *InmemoryContainer) WSHub() *ws.Hub                               { return ws.NewHub(nil) }
+func (c *InmemoryContainer) SessionRegistry() *session.Registry           { return nil }
+func (c *InmemoryContainer) CommandHandler() *grpchandlers.CommandHandler { return nil }
+func (c *InmemoryContainer) AttachHandler() *grpchandlers.AttachHandler   { return nil }
+func (c *InmemoryContainer) MetricsHub() metrics.Hub                      { return nil }
+func (c *InmemoryContainer) PubSub() pubsub.PubSub                        { return nil }
+func (c *InmemoryContainer) ACMEService() *acme.Service                   { return nil }
+
+// AuditLogger returns the configured audit logger, defaulting to a no-op.
+// Tests asserting on audit output inject a capturing logger via
+// SetAuditLogger.
+func (c *InmemoryContainer) AuditLogger() audit.Logger {
+	if c.auditLogger == nil {
+		c.auditLogger = audit.NopLogger{}
+	}
+
+	return c.auditLogger
+}
+
+// SetAuditLogger overrides the audit logger (e.g. with a capturing logger
+// in audit-assertion tests).
+func (c *InmemoryContainer) SetAuditLogger(l audit.Logger) {
+	c.auditLogger = l
+}
+
+// FileUploadMIMEChecker returns a permissive MIME checker for tests so
+// existing upload integrations (which use opaque random bodies) keep
+// passing. Tests that exercise the C-8 rejection path construct their
+// own Checker explicitly.
+func (c *InmemoryContainer) FileUploadMIMEChecker() *filemanagermime.Checker {
+	return filemanagermime.NewChecker(filemanagermime.Config{
+		AllowArchives: true,
+		AllowBinary:   true,
+	})
+}
 func (c *InmemoryContainer) EnrollmentService() *enrollment.Service {
 	keyManager := enrollment.NewSetupKeyManager(c.cacheService, "")
 
@@ -153,10 +204,9 @@ func (c *InmemoryContainer) EnrollmentService() *enrollment.Service {
 	)
 }
 
-func (c *InmemoryContainer) EnrollmentServiceOrNil() *enrollment.Service { return nil }
-func (c *InmemoryContainer) GRPCPort() uint16                            { return 31718 }
-func (c *InmemoryContainer) GRPCExternalHost() string                    { return "" }
-func (c *InmemoryContainer) GRPCExternalPort() uint16                    { return 0 }
+func (c *InmemoryContainer) GRPCPort() uint16         { return 31718 }
+func (c *InmemoryContainer) GRPCExternalHost() string { return "" }
+func (c *InmemoryContainer) GRPCExternalPort() uint16 { return 0 }
 
 type nopUploader struct{}
 
@@ -181,26 +231,32 @@ func buildInmemoryTestContainer() *InmemoryContainer {
 	serverSettingRepo := inmemory.NewServerSettingRepository()
 	tm := services.NewNilTransactionManager()
 
+	twoFactorManager, tfErr := twofactor.NewManager([]byte("test-encryption-key-testing"))
+	if tfErr != nil {
+		panic(tfErr)
+	}
+
 	c := &InmemoryContainer{
 		cfg: &config.Config{
 			AuthSecret:    "test-secret-key-for-testing",
 			EncryptionKey: "test-encryption-key-testing",
 		},
-		responder:             pkgapi.NewResponder(),
-		gameRepo:              inmemory.NewGameRepository(),
-		gameModRepo:           inmemory.NewGameModRepository(),
-		serverRepo:            serverRepo,
-		userRepo:              userRepo,
-		authService:           auth.NewJWTService([]byte("test-secret-key-for-testing")),
-		userService:           services.NewUserService(userRepo),
-		rbacRepo:              rbacRepo,
-		tokenRepo:             inmemory.NewPersonalAccessTokenRepository(),
-		daemonTaskRepo:        daemonTaskRepo,
-		serverTaskRepo:        inmemory.NewServerTaskRepository(serverRepo),
-		serverTaskFailRepo:    inmemory.NewServerTaskFailRepository(),
-		serverSettingRepo:     serverSettingRepo,
-		nodeRepo:              inmemory.NewNodeRepository(),
-		clientCertificateRepo: inmemory.NewClientCertificateRepository(),
+		responder:               pkgapi.NewResponder(),
+		gameRepo:                inmemory.NewGameRepository(),
+		gameModRepo:             inmemory.NewGameModRepository(),
+		serverRepo:              serverRepo,
+		userRepo:                userRepo,
+		authService:             auth.NewJWTService([]byte("test-secret-key-for-testing")),
+		twoFactorManager:        twoFactorManager,
+		userService:             services.NewUserService(userRepo),
+		rbacRepo:                rbacRepo,
+		tokenRepo:               inmemory.NewPersonalAccessTokenRepository(),
+		daemonTaskRepo:          daemonTaskRepo,
+		serverTaskRepo:          inmemory.NewServerTaskRepository(serverRepo),
+		serverTaskExecutionRepo: inmemory.NewServerTaskExecutionRepository(),
+		serverSettingRepo:       serverSettingRepo,
+		nodeRepo:                inmemory.NewNodeRepository(),
+		clientCertificateRepo:   inmemory.NewClientCertificateRepository(),
 		// Use a very short cache TTL so that role/permission changes are observed
 		// immediately by tests (e.g. revoking admin must remove access on the next request).
 		rbacService:           rbac.NewRBAC(tm, rbacRepo, time.Millisecond),

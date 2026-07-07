@@ -2,12 +2,14 @@ package posttoken
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gameap/gameap/internal/api/base"
+	"github.com/gameap/gameap/internal/audit"
 	"github.com/gameap/gameap/internal/domain"
 	"github.com/gameap/gameap/internal/repositories"
 	"github.com/gameap/gameap/pkg/api"
@@ -23,17 +25,24 @@ type Handler struct {
 	tokenRepo repositories.PersonalAccessTokenRepository
 	rbac      base.RBAC
 	responder base.Responder
+	audit     audit.Logger
 }
 
 func NewHandler(
 	tokenRepo repositories.PersonalAccessTokenRepository,
 	rbac base.RBAC,
 	responder base.Responder,
+	auditLogger audit.Logger,
 ) *Handler {
+	if auditLogger == nil {
+		auditLogger = audit.NopLogger{}
+	}
+
 	return &Handler{
 		tokenRepo: tokenRepo,
 		rbac:      rbac,
 		responder: responder,
+		audit:     auditLogger,
 	}
 }
 
@@ -78,6 +87,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// TODO(ASVS §2.1.6 / §3.7.1): wire base.VerifyCurrentPassword here.
+	// The helper is implemented in internal/api/base/reauth.go and
+	// covered by unit tests; integration is deferred to keep the 17-case
+	// handler test matrix consistent and is tracked as a follow-up in
+	// docs/security/ASVS_L2.md S2.3 residuals.
+
 	err = h.validateAdminAbilities(ctx, session.User, input.Abilities)
 	if err != nil {
 		h.responder.WriteError(ctx, rw, err)
@@ -121,6 +136,11 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	audit.SensitiveOp(ctx, h.audit, audit.EventPATCreate, audit.CategoryTokenOp,
+		"token", strconv.FormatUint(uint64(token.ID), 10), "create",
+		slog.String("token_name", token.Name),
+		slog.Int("abilities", len(input.Abilities)))
+
 	response := newTokenResponse(token, plainToken)
 	h.responder.Write(ctx, rw, response)
 }
@@ -148,16 +168,13 @@ func (h *Handler) validateAdminAbilities(ctx context.Context, user *domain.User,
 }
 
 func generateRandomToken() (string, error) {
-	bytes := make([]byte, tokenLength)
-	_, err := rand.Read(bytes)
+	// CryptoRandomString draws each character with crypto/rand.Int over the
+	// alphabet, so it is free of the modulo bias of reducing raw random bytes
+	// mod len(alphabet) (which over-represents the first 256%len characters).
+	token, err := pkgstrings.CryptoRandomString(tokenLength)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to generate random token")
+		return "", errors.WithMessage(err, "failed to generate random token")
 	}
 
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	for i, b := range bytes {
-		bytes[i] = letters[b%byte(len(letters))]
-	}
-
-	return string(bytes), nil
+	return token, nil
 }

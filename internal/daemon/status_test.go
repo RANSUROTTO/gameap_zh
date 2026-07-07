@@ -2,599 +2,452 @@ package daemon
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gameap/gameap/internal/daemon/binnapi"
 	"github.com/gameap/gameap/internal/domain"
-	"github.com/gameap/gameap/internal/files"
-	"github.com/gameap/gameap/internal/repositories/inmemory"
+	"github.com/gameap/gameap/pkg/proto"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// func TestStatusService_Status_Success(t *testing.T) {
-//	// ARRANGE
-//	nodeRepo := inmemory.NewNodeRepository()
-//	certRepo := inmemory.NewClientCertificateRepository()
-//	fileManager := files.NewInMemoryFileManager()
-//
-//	ctx := context.Background()
-//
-//	cert := &domain.ClientCertificate{
-//		Fingerprint: "test-fingerprint",
-//		Expires:     time.Now().Add(365 * 24 * time.Hour),
-//		Certificate: "certificates/client.crt",
-//		PrivateKey:  "certificates/client.key",
-//	}
-//	err := certRepo.Save(ctx, cert)
-//	require.NoError(t, err)
-//	require.NotZero(t, cert.ID)
-//
-//	// Save certificate files
-//	err = fileManager.Write(ctx, cert.Certificate, []byte(clientCert))
-//	require.NoError(t, err)
-//	err = fileManager.Write(ctx, cert.PrivateKey, []byte(clientKey))
-//	require.NoError(t, err)
-//
-//	// Create node
-//	node := &domain.Node{
-//		Enabled:             true,
-//		Name:                "Test Node",
-//		OS:                  "linux",
-//		Location:            "test-location",
-//		WorkPath:            "/srv/gameap",
-//		GdaemonHost:         "127.0.0.1",
-//		GdaemonPort:         31717,
-//		GDaemonAPIKey:       "test-key",
-//		GdaemonServerCert:   "certificates/server.crt",
-//		ClientCertificateID: cert.ID,
-//		PreferInstallMethod: "auto",
-//	}
-//	err = nodeRepo.Save(ctx, node)
-//	require.NoError(t, err)
-//	require.NotZero(t, node.ID)
-//
-//	// Save server certificate
-//	err = fileManager.Write(ctx, node.GdaemonServerCert, []byte(daemonServerCert))
-//	require.NoError(t, err)
-//
-//	// Create status service
-//	statusService := NewStatusBINNService(certRepo, fileManager)
-//
-//	// ACT
-//	status, err := statusService.Status(ctx, node.ID)
-//
-//	// ASSERT
-//	require.NoError(t, err)
-//	assert.NotNil(t, status)
-//	assert.NotEmpty(t, status.Version)
-//	assert.NotEmpty(t, status.BuildDate)
-//	assert.GreaterOrEqual(t, status.Uptime, time.Duration(0))
-//	assert.GreaterOrEqual(t, status.WorkingTasks, 0)
-//	assert.GreaterOrEqual(t, status.WaitingTasks, 0)
-//	assert.GreaterOrEqual(t, status.OnlineServers, 0)
-//
-//	t.Logf("Status: Version=%s, BuildDate=%s, Uptime=%s, WorkingTasks=%d, WaitingTasks=%d, OnlineServers=%d",
-//		status.Version,
-//		status.BuildDate,
-//		status.Uptime,
-//		status.WorkingTasks,
-//		status.WaitingTasks,
-//		status.OnlineServers,
-//	)
-//}
+// fakeStatusGateway is a configurable in-test fake for StatusGateway.
+type fakeStatusGateway struct {
+	mu sync.Mutex
 
-func TestStatusService_Status_Success(t *testing.T) {
+	requestStatus func(ctx context.Context, nodeID uint64) (*proto.StatusResponse, error)
+
+	requestCalls atomic.Int32
+
+	lastNodeID uint64
+}
+
+func (f *fakeStatusGateway) RequestStatus(
+	ctx context.Context, nodeID uint64,
+) (*proto.StatusResponse, error) {
+	f.requestCalls.Add(1)
+	f.mu.Lock()
+	f.lastNodeID = nodeID
+	fn := f.requestStatus
+	f.mu.Unlock()
+
+	if fn == nil {
+		return &proto.StatusResponse{Success: true}, nil
+	}
+
+	return fn(ctx, nodeID)
+}
+
+// fakeStatusDispatcher is a configurable in-test fake for StatusDispatcher.
+type fakeStatusDispatcher struct {
+	mu sync.Mutex
+
+	dispatchStatus func(ctx context.Context, nodeID uint64) (*proto.StatusResponse, error)
+
+	dispatchCalls atomic.Int32
+
+	lastNodeID uint64
+}
+
+func (f *fakeStatusDispatcher) Start(_ context.Context) error {
+	return nil
+}
+
+func (f *fakeStatusDispatcher) DispatchStatus(
+	ctx context.Context, nodeID uint64,
+) (*proto.StatusResponse, error) {
+	f.dispatchCalls.Add(1)
+	f.mu.Lock()
+	f.lastNodeID = nodeID
+	fn := f.dispatchStatus
+	f.mu.Unlock()
+
+	if fn == nil {
+		return &proto.StatusResponse{Success: true}, nil
+	}
+
+	return fn(ctx, nodeID)
+}
+
+func TestStatusService_Status(t *testing.T) {
+	t.Parallel()
+
+	type setup struct {
+		isConnected         bool
+		isConnectedAnywhere bool
+		gatewayResp         *proto.StatusResponse
+		gatewayErr          error
+		dispatcherResp      *proto.StatusResponse
+		dispatcherErr       error
+	}
+
+	tests := []struct {
+		name              string
+		setup             setup
+		wantGatewayCalls  int32
+		wantDispatchCalls int32
+		wantStatus        *NodeStatus
+		wantError         string
+		wantSentinel      bool
+	}{
+		{
+			name: "routes_to_gateway_when_IsConnected_true",
+			setup: setup{
+				isConnected: true,
+				gatewayResp: &proto.StatusResponse{
+					Success:       true,
+					Version:       "1.0",
+					BuildDate:     "2026-04-01",
+					UptimeSeconds: 60,
+					WorkingTasks:  2,
+					WaitingTasks:  3,
+					OnlineServers: 5,
+				},
+			},
+			wantGatewayCalls:  1,
+			wantDispatchCalls: 0,
+			wantStatus: &NodeStatus{
+				Uptime:        60 * time.Second,
+				Version:       "1.0",
+				BuildDate:     "2026-04-01",
+				WorkingTasks:  2,
+				WaitingTasks:  3,
+				OnlineServers: 5,
+			},
+		},
+		{
+			name: "routes_to_dispatcher_when_only_IsConnectedAnywhere_true",
+			setup: setup{
+				isConnectedAnywhere: true,
+				dispatcherResp: &proto.StatusResponse{
+					Success:       true,
+					Version:       "1.1",
+					BuildDate:     "2026-04-02",
+					UptimeSeconds: 120,
+					OnlineServers: 7,
+				},
+			},
+			wantGatewayCalls:  0,
+			wantDispatchCalls: 1,
+			wantStatus: &NodeStatus{
+				Uptime:        120 * time.Second,
+				Version:       "1.1",
+				BuildDate:     "2026-04-02",
+				OnlineServers: 7,
+			},
+		},
+		{
+			name: "returns_ErrDaemonNotConnected_when_neither_connected",
+			setup: setup{
+				isConnected:         false,
+				isConnectedAnywhere: false,
+			},
+			wantGatewayCalls:  0,
+			wantDispatchCalls: 0,
+			wantError:         "daemon not connected",
+			wantSentinel:      true,
+		},
+		{
+			name: "gateway_returns_error_response_when_Success_false",
+			setup: setup{
+				isConnected: true,
+				gatewayResp: &proto.StatusResponse{Success: false, Error: "daemon overloaded"},
+			},
+			wantGatewayCalls:  1,
+			wantDispatchCalls: 0,
+			wantError:         "status request: daemon overloaded",
+		},
+		{
+			name: "dispatcher_returns_error_response_when_Success_false",
+			setup: setup{
+				isConnectedAnywhere: true,
+				dispatcherResp:      &proto.StatusResponse{Success: false, Error: "node busy"},
+			},
+			wantGatewayCalls:  0,
+			wantDispatchCalls: 1,
+			wantError:         "status request: node busy",
+		},
+		{
+			name: "gateway_transport_error_wrapped",
+			setup: setup{
+				isConnected: true,
+				gatewayErr:  errors.New("boom"),
+			},
+			wantGatewayCalls:  1,
+			wantDispatchCalls: 0,
+			wantError:         "gateway status request: boom",
+		},
+		{
+			name: "dispatcher_transport_error_wrapped",
+			setup: setup{
+				isConnectedAnywhere: true,
+				dispatcherErr:       errors.New("boom"),
+			},
+			wantGatewayCalls:  0,
+			wantDispatchCalls: 1,
+			wantError:         "dispatched status request: boom",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// ARRANGE
+			ctx := testContext(t)
+			node := &domain.Node{ID: 99}
+
+			gateway := &fakeStatusGateway{
+				requestStatus: func(_ context.Context, _ uint64) (*proto.StatusResponse, error) {
+					if tt.setup.gatewayErr != nil {
+						return nil, tt.setup.gatewayErr
+					}
+
+					return tt.setup.gatewayResp, nil
+				},
+			}
+			dispatcher := &fakeStatusDispatcher{
+				dispatchStatus: func(_ context.Context, _ uint64) (*proto.StatusResponse, error) {
+					if tt.setup.dispatcherErr != nil {
+						return nil, tt.setup.dispatcherErr
+					}
+
+					return tt.setup.dispatcherResp, nil
+				},
+			}
+			registry := newFakeConnectionChecker()
+			registry.setConnected(99, tt.setup.isConnected)
+			registry.connectedAnywhere[99] = tt.setup.isConnectedAnywhere
+
+			service := NewStatusService(gateway, registry, dispatcher, nil)
+
+			// ACT
+			got, err := service.Status(ctx, node)
+
+			// ASSERT
+			assert.Equal(t, tt.wantGatewayCalls, gateway.requestCalls.Load(), "gateway calls count mismatch")
+			assert.Equal(t, tt.wantDispatchCalls, dispatcher.dispatchCalls.Load(), "dispatcher calls count mismatch")
+
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError, "error message mismatch")
+				assert.Nil(t, got, "status must be nil on error")
+
+				if tt.wantSentinel {
+					assert.ErrorIs(t, err, ErrDaemonNotConnected, "must be ErrDaemonNotConnected sentinel")
+				}
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tt.wantStatus.Uptime, got.Uptime, "uptime must match")
+			assert.Equal(t, tt.wantStatus.Version, got.Version, "version must match")
+			assert.Equal(t, tt.wantStatus.BuildDate, got.BuildDate, "build date must match")
+			assert.Equal(t, tt.wantStatus.WorkingTasks, got.WorkingTasks, "working tasks must match")
+			assert.Equal(t, tt.wantStatus.WaitingTasks, got.WaitingTasks, "waiting tasks must match")
+			assert.Equal(t, tt.wantStatus.OnlineServers, got.OnlineServers, "online servers must match")
+		})
+	}
+}
+
+func TestStatusService_Version(t *testing.T) {
+	t.Parallel()
+
+	type setup struct {
+		isConnected         bool
+		isConnectedAnywhere bool
+		gatewayResp         *proto.StatusResponse
+		gatewayErr          error
+		dispatcherResp      *proto.StatusResponse
+		dispatcherErr       error
+	}
+
+	tests := []struct {
+		name              string
+		setup             setup
+		wantGatewayCalls  int32
+		wantDispatchCalls int32
+		wantVersion       *NodeVersion
+		wantError         string
+		wantSentinel      bool
+	}{
+		{
+			name: "gateway_returns_version_on_success",
+			setup: setup{
+				isConnected: true,
+				gatewayResp: &proto.StatusResponse{Version: "2.5.1", BuildDate: "2026-01-15"},
+			},
+			wantGatewayCalls:  1,
+			wantDispatchCalls: 0,
+			wantVersion:       &NodeVersion{Version: "2.5.1", BuildDate: "2026-01-15"},
+		},
+		{
+			name: "dispatcher_returns_version_on_anywhere",
+			setup: setup{
+				isConnectedAnywhere: true,
+				dispatcherResp:      &proto.StatusResponse{Version: "3.0.0", BuildDate: "2026-02-10"},
+			},
+			wantGatewayCalls:  0,
+			wantDispatchCalls: 1,
+			wantVersion:       &NodeVersion{Version: "3.0.0", BuildDate: "2026-02-10"},
+		},
+		{
+			name: "returns_ErrDaemonNotConnected_when_neither_connected",
+			setup: setup{
+				isConnected:         false,
+				isConnectedAnywhere: false,
+			},
+			wantGatewayCalls:  0,
+			wantDispatchCalls: 0,
+			wantError:         "daemon not connected",
+			wantSentinel:      true,
+		},
+		{
+			name: "gateway_transport_error_wrapped",
+			setup: setup{
+				isConnected: true,
+				gatewayErr:  errors.New("boom"),
+			},
+			wantGatewayCalls:  1,
+			wantDispatchCalls: 0,
+			wantError:         "gateway status request: boom",
+		},
+		{
+			name: "dispatcher_transport_error_wrapped",
+			setup: setup{
+				isConnectedAnywhere: true,
+				dispatcherErr:       errors.New("boom"),
+			},
+			wantGatewayCalls:  0,
+			wantDispatchCalls: 1,
+			wantError:         "dispatched status request: boom",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// ARRANGE
+			ctx := testContext(t)
+			node := &domain.Node{ID: 123}
+
+			gateway := &fakeStatusGateway{
+				requestStatus: func(_ context.Context, _ uint64) (*proto.StatusResponse, error) {
+					if tt.setup.gatewayErr != nil {
+						return nil, tt.setup.gatewayErr
+					}
+
+					return tt.setup.gatewayResp, nil
+				},
+			}
+			dispatcher := &fakeStatusDispatcher{
+				dispatchStatus: func(_ context.Context, _ uint64) (*proto.StatusResponse, error) {
+					if tt.setup.dispatcherErr != nil {
+						return nil, tt.setup.dispatcherErr
+					}
+
+					return tt.setup.dispatcherResp, nil
+				},
+			}
+			registry := newFakeConnectionChecker()
+			registry.setConnected(123, tt.setup.isConnected)
+			registry.connectedAnywhere[123] = tt.setup.isConnectedAnywhere
+
+			service := NewStatusService(gateway, registry, dispatcher, nil)
+
+			// ACT
+			got, err := service.Version(ctx, node)
+
+			// ASSERT
+			assert.Equal(t, tt.wantGatewayCalls, gateway.requestCalls.Load(), "gateway calls count mismatch")
+			assert.Equal(t, tt.wantDispatchCalls, dispatcher.dispatchCalls.Load(), "dispatcher calls count mismatch")
+
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError, "error message mismatch")
+				assert.Nil(t, got, "version must be nil on error")
+
+				if tt.wantSentinel {
+					assert.ErrorIs(t, err, ErrDaemonNotConnected, "must be ErrDaemonNotConnected sentinel")
+				}
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tt.wantVersion.Version, got.Version, "version must match")
+			assert.Equal(t, tt.wantVersion.BuildDate, got.BuildDate, "build date must match")
+		})
+	}
+}
+
+func TestStatusService_ConnectionType(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                string
+		isConnected         bool
+		isConnectedAnywhere bool
+		want                string
+	}{
+		{
+			name:        "returns_grpc_when_IsConnected_true",
+			isConnected: true,
+			want:        ConnectionTypeGRPC,
+		},
+		{
+			name:                "returns_grpc_when_only_IsConnectedAnywhere_true",
+			isConnectedAnywhere: true,
+			want:                ConnectionTypeGRPC,
+		},
+		{
+			name: "returns_none_when_neither_connected",
+			want: ConnectionTypeNone,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// ARRANGE
+			const nodeID uint64 = 55
+			gateway := &fakeStatusGateway{}
+			dispatcher := &fakeStatusDispatcher{}
+			registry := newFakeConnectionChecker()
+			registry.setConnected(nodeID, tt.isConnected)
+			registry.connectedAnywhere[nodeID] = tt.isConnectedAnywhere
+
+			service := NewStatusService(gateway, registry, dispatcher, nil)
+
+			// ACT
+			got := service.ConnectionType(nodeID)
+
+			// ASSERT
+			assert.Equal(t, tt.want, got, "connection type mismatch")
+		})
+	}
+}
+
+func TestNewStatusService_nilLogger_usesDefault(t *testing.T) {
+	t.Parallel()
+
 	// ARRANGE
-	mockServer, err := NewMockDaemonServer(t)
-	require.NoError(t, err)
-	defer mockServer.Stop()
-
-	mockServer.Responses = []any{
-		&binnapi.StatusVersionResponseMessage{
-			Version:   "3.9.0",
-			BuildDate: "2025-10-15",
-		},
-		&binnapi.StatusInfoBaseResponseMessage{
-			Uptime:        "2h30m15s",
-			WorkingTasks:  "5",
-			WaitingTasks:  "3",
-			OnlineServers: "10",
-		},
-	}
-
-	mockServer.Start()
-
-	nodeRepo := inmemory.NewNodeRepository()
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	ctx := context.Background()
-
-	cert := &domain.ClientCertificate{
-		Fingerprint: "test-fingerprint",
-		Expires:     time.Now().Add(365 * 24 * time.Hour),
-		Certificate: "certificates/client.crt",
-		PrivateKey:  "certificates/client.key",
-	}
-	err = certRepo.Save(ctx, cert)
-	require.NoError(t, err)
-
-	err = fileManager.Write(ctx, cert.Certificate, []byte(clientCert))
-	require.NoError(t, err)
-	err = fileManager.Write(ctx, cert.PrivateKey, []byte(clientKey))
-	require.NoError(t, err)
-
-	node := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node",
-		OS:                  "linux",
-		Location:            "test-location",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         mockServer.Host(),
-		GdaemonPort:         mockServer.Port(),
-		GdaemonAPIKey:       "test-key",
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-		PreferInstallMethod: "auto",
-	}
-	err = nodeRepo.Save(ctx, node)
-	require.NoError(t, err)
-
-	err = fileManager.Write(ctx, node.GdaemonServerCert, []byte(daemonServerCert))
-	require.NoError(t, err)
-
-	statusService := NewStatusBINNService(certRepo, fileManager)
+	gateway := &fakeStatusGateway{}
+	dispatcher := &fakeStatusDispatcher{}
+	registry := newFakeConnectionChecker()
 
 	// ACT
-	status, err := statusService.Status(ctx, node)
+	service := NewStatusService(gateway, registry, dispatcher, nil)
 
 	// ASSERT
-	require.NoError(t, err)
-	assert.NotNil(t, status)
-	assert.Equal(t, "3.9.0", status.Version)
-	assert.Equal(t, "2025-10-15", status.BuildDate)
-	assert.Equal(t, 2*time.Hour+30*time.Minute+15*time.Second, status.Uptime)
-	assert.Equal(t, 5, status.WorkingTasks)
-	assert.Equal(t, 3, status.WaitingTasks)
-	assert.Equal(t, 10, status.OnlineServers)
-
-	t.Logf("Status: Version=%s, BuildDate=%s, Uptime=%s, WorkingTasks=%d, WaitingTasks=%d, OnlineServers=%d",
-		status.Version,
-		status.BuildDate,
-		status.Uptime,
-		status.WorkingTasks,
-		status.WaitingTasks,
-		status.OnlineServers,
-	)
-}
-
-func TestStatusService_Status_MissingServerCertificate(t *testing.T) {
-	// Setup repositories
-	nodeRepo := inmemory.NewNodeRepository()
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	// Create test data
-	ctx := context.Background()
-
-	// Save client certificate
-	cert := &domain.ClientCertificate{
-		Fingerprint: "test-fingerprint",
-		Expires:     time.Now().Add(365 * 24 * time.Hour),
-		Certificate: "certificates/client.crt",
-		PrivateKey:  "certificates/client.key",
-	}
-	err := certRepo.Save(ctx, cert)
-	require.NoError(t, err)
-
-	// Create node without saving server certificate
-	node := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node",
-		OS:                  "linux",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         "127.0.0.1",
-		GdaemonPort:         31717,
-		GdaemonAPIKey:       "test-key",
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-	}
-	err = nodeRepo.Save(ctx, node)
-	require.NoError(t, err)
-
-	// Create status service
-	statusService := NewStatusBINNService(certRepo, fileManager)
-
-	// Execute test
-	status, err := statusService.Status(ctx, node)
-
-	// Assert results
-	assert.Error(t, err)
-	assert.Nil(t, status)
-	assert.Contains(t, err.Error(), "failed to read server certificate")
-}
-
-func TestStatusService_Status_MissingClientCertificate(t *testing.T) {
-	// Setup repositories
-	nodeRepo := inmemory.NewNodeRepository()
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	// Create test data
-	ctx := context.Background()
-
-	// Save client certificate but not the certificate files
-	cert := &domain.ClientCertificate{
-		Fingerprint: "test-fingerprint",
-		Expires:     time.Now().Add(365 * 24 * time.Hour),
-		Certificate: "certificates/client.crt",
-		PrivateKey:  "certificates/client.key",
-	}
-	err := certRepo.Save(ctx, cert)
-	require.NoError(t, err)
-
-	// Create node
-	node := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node",
-		OS:                  "linux",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         "127.0.0.1",
-		GdaemonPort:         31717,
-		GdaemonAPIKey:       "test-key",
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-	}
-	err = nodeRepo.Save(ctx, node)
-	require.NoError(t, err)
-
-	// Save only server certificate
-	err = fileManager.Write(ctx, node.GdaemonServerCert, []byte(daemonServerCert))
-	require.NoError(t, err)
-
-	// Create status service
-	statusService := NewStatusBINNService(certRepo, fileManager)
-
-	// Execute test
-	status, err := statusService.Status(ctx, node)
-
-	// Assert results
-	assert.Error(t, err)
-	assert.Nil(t, status)
-	assert.Contains(t, err.Error(), "failed to read client certificate")
-}
-
-func TestStatusService_Status_MissingPrivateKey(t *testing.T) {
-	// Setup repositories
-	nodeRepo := inmemory.NewNodeRepository()
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	// Create test data
-	ctx := context.Background()
-
-	// Save client certificate
-	cert := &domain.ClientCertificate{
-		Fingerprint: "test-fingerprint",
-		Expires:     time.Now().Add(365 * 24 * time.Hour),
-		Certificate: "certificates/client.crt",
-		PrivateKey:  "certificates/client.key",
-	}
-	err := certRepo.Save(ctx, cert)
-	require.NoError(t, err)
-
-	// Save only client certificate, not private key
-	err = fileManager.Write(ctx, cert.Certificate, []byte(clientCert))
-	require.NoError(t, err)
-
-	// Create node
-	node := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node",
-		OS:                  "linux",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         "127.0.0.1",
-		GdaemonPort:         31717,
-		GdaemonAPIKey:       "test-key",
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-	}
-	err = nodeRepo.Save(ctx, node)
-	require.NoError(t, err)
-
-	// Save server certificate
-	err = fileManager.Write(ctx, node.GdaemonServerCert, []byte(daemonServerCert))
-	require.NoError(t, err)
-
-	// Create status service
-	statusService := NewStatusBINNService(certRepo, fileManager)
-
-	// Execute test
-	status, err := statusService.Status(ctx, node)
-
-	// Assert results
-	assert.Error(t, err)
-	assert.Nil(t, status)
-	assert.Contains(t, err.Error(), "failed to read private key")
-}
-
-func TestStatusService_Status_PoolReuse(t *testing.T) {
-	// ARRANGE
-	mockServer, err := NewMockDaemonServer(t)
-	require.NoError(t, err)
-	defer mockServer.Stop()
-
-	mockServer.Responses = []any{
-		&binnapi.StatusVersionResponseMessage{Version: "3.9.0", BuildDate: "2025-10-15"},
-		&binnapi.StatusInfoBaseResponseMessage{Uptime: "1h0m0s", WorkingTasks: "1", WaitingTasks: "1", OnlineServers: "1"},
-		&binnapi.StatusVersionResponseMessage{Version: "3.9.0", BuildDate: "2025-10-15"},
-		&binnapi.StatusInfoBaseResponseMessage{Uptime: "1h1m0s", WorkingTasks: "2", WaitingTasks: "2", OnlineServers: "2"},
-		&binnapi.StatusVersionResponseMessage{Version: "3.9.0", BuildDate: "2025-10-15"},
-		&binnapi.StatusInfoBaseResponseMessage{Uptime: "1h2m0s", WorkingTasks: "3", WaitingTasks: "3", OnlineServers: "3"},
-	}
-
-	mockServer.Start()
-
-	nodeRepo := inmemory.NewNodeRepository()
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	ctx := context.Background()
-
-	cert := &domain.ClientCertificate{
-		Fingerprint: "test-fingerprint",
-		Expires:     time.Now().Add(365 * 24 * time.Hour),
-		Certificate: "certificates/client.crt",
-		PrivateKey:  "certificates/client.key",
-	}
-	err = certRepo.Save(ctx, cert)
-	require.NoError(t, err)
-
-	err = fileManager.Write(ctx, cert.Certificate, []byte(clientCert))
-	require.NoError(t, err)
-	err = fileManager.Write(ctx, cert.PrivateKey, []byte(clientKey))
-	require.NoError(t, err)
-
-	node := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node",
-		OS:                  "linux",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         mockServer.Host(),
-		GdaemonPort:         mockServer.Port(),
-		GdaemonLogin:        new("gameap"),
-		GdaemonPassword:     new("gameap123"),
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-	}
-	err = nodeRepo.Save(ctx, node)
-	require.NoError(t, err)
-
-	err = fileManager.Write(ctx, node.GdaemonServerCert, []byte(daemonServerCert))
-	require.NoError(t, err)
-
-	statusService := NewStatusBINNService(certRepo, fileManager)
-
-	// ACT - Execute multiple status requests
-	status1, err := statusService.Status(ctx, node)
-	require.NoError(t, err)
-	assert.Equal(t, 1, status1.WorkingTasks)
-
-	status2, err := statusService.Status(ctx, node)
-	require.NoError(t, err)
-	assert.Equal(t, 2, status2.WorkingTasks)
-
-	status3, err := statusService.Status(ctx, node)
-	require.NoError(t, err)
-	assert.Equal(t, 3, status3.WorkingTasks)
-
-	// ASSERT
-	statusService.mu.RLock()
-	poolCount := len(statusService.pools)
-	statusService.mu.RUnlock()
-
-	assert.Equal(t, 1, poolCount, "Expected only one pool to be created for the same node")
-	mockServer.AssertMinRequestCount(6)
-
-	t.Logf("Successfully executed %d status requests using the same pool", 3)
-}
-
-func TestStatusService_Status_MultipleNodes(t *testing.T) {
-	// ARRANGE
-	mockServer, err := NewMockDaemonServer(t)
-	require.NoError(t, err)
-	defer mockServer.Stop()
-
-	mockServer.Responses = []any{
-		&binnapi.StatusVersionResponseMessage{Version: "3.9.0", BuildDate: "2025-10-15"},
-		&binnapi.StatusInfoBaseResponseMessage{Uptime: "1h0m0s", WorkingTasks: "1", WaitingTasks: "1", OnlineServers: "5"},
-		&binnapi.StatusVersionResponseMessage{Version: "3.9.0", BuildDate: "2025-10-15"},
-		&binnapi.StatusInfoBaseResponseMessage{Uptime: "2h0m0s", WorkingTasks: "1", WaitingTasks: "1", OnlineServers: "5"},
-	}
-
-	mockServer.Start()
-
-	nodeRepo := inmemory.NewNodeRepository()
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	ctx := context.Background()
-
-	cert := &domain.ClientCertificate{
-		Fingerprint: "test-fingerprint",
-		Expires:     time.Now().Add(365 * 24 * time.Hour),
-		Certificate: "certificates/client.crt",
-		PrivateKey:  "certificates/client.key",
-	}
-	err = certRepo.Save(ctx, cert)
-	require.NoError(t, err)
-
-	err = fileManager.Write(ctx, cert.Certificate, []byte(clientCert))
-	require.NoError(t, err)
-	err = fileManager.Write(ctx, cert.PrivateKey, []byte(clientKey))
-	require.NoError(t, err)
-
-	node1 := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node 1",
-		OS:                  "linux",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         mockServer.Host(),
-		GdaemonPort:         mockServer.Port(),
-		GdaemonLogin:        new("gameap"),
-		GdaemonPassword:     new("gameap123"),
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-	}
-	err = nodeRepo.Save(ctx, node1)
-	require.NoError(t, err)
-
-	node2 := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node 2",
-		OS:                  "linux",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         mockServer.Host(),
-		GdaemonPort:         mockServer.Port(),
-		GdaemonLogin:        new("gameap"),
-		GdaemonPassword:     new("gameap123"),
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-	}
-	err = nodeRepo.Save(ctx, node2)
-	require.NoError(t, err)
-
-	err = fileManager.Write(ctx, node1.GdaemonServerCert, []byte(daemonServerCert))
-	require.NoError(t, err)
-
-	statusService := NewStatusBINNService(certRepo, fileManager)
-
-	// ACT
-	status1, err := statusService.Status(ctx, node1)
-	require.NoError(t, err)
-	assert.NotNil(t, status1)
-	assert.Equal(t, "3.9.0", status1.Version)
-	assert.Equal(t, 1, status1.WorkingTasks)
-
-	status2, err := statusService.Status(ctx, node2)
-	require.NoError(t, err)
-	assert.NotNil(t, status2)
-	assert.Equal(t, "3.9.0", status2.Version)
-	assert.Equal(t, 1, status2.WorkingTasks)
-
-	// ASSERT
-	statusService.mu.RLock()
-	poolCount := len(statusService.pools)
-	statusService.mu.RUnlock()
-
-	assert.Equal(t, 2, poolCount, "Expected separate pools for each node")
-	mockServer.AssertMinRequestCount(4)
-}
-
-func TestStatusService_Status_InvalidNodeID(t *testing.T) {
-	// Setup repositories
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	// Create status service
-	statusService := NewStatusBINNService(certRepo, fileManager)
-
-	// Execute test with invalid node ID (0)
-	ctx := context.Background()
-	status, err := statusService.Status(ctx, nil)
-
-	// Assert results
-	assert.Error(t, err)
-	assert.Nil(t, status)
-}
-
-func TestStatusService_Status_WithMockDaemon(t *testing.T) {
-	// Create and start mock daemon server
-	mockServer, err := NewMockDaemonServer(t)
-	require.NoError(t, err)
-	defer mockServer.Stop()
-
-	// Configure custom responses for this test
-	mockServer.Responses = []any{
-		&binnapi.StatusVersionResponseMessage{
-			Version:   "3.5.0-mock",
-			BuildDate: "2025-10-15",
-		},
-		&binnapi.StatusInfoBaseResponseMessage{
-			Uptime:        "5h20m30s",
-			WorkingTasks:  "8",
-			WaitingTasks:  "12",
-			OnlineServers: "6",
-		},
-	}
-
-	mockServer.Start()
-
-	// Setup repositories
-	nodeRepo := inmemory.NewNodeRepository()
-	certRepo := inmemory.NewClientCertificateRepository()
-	fileManager := files.NewInMemoryFileManager()
-
-	// Create test data
-	ctx := context.Background()
-
-	// Save client certificate
-	cert := &domain.ClientCertificate{
-		Fingerprint: "test-fingerprint-mock",
-		Expires:     time.Now().Add(365 * 24 * time.Hour),
-		Certificate: "certificates/client.crt",
-		PrivateKey:  "certificates/client.key",
-	}
-	err = certRepo.Save(ctx, cert)
-	require.NoError(t, err)
-	require.NotZero(t, cert.ID)
-
-	// Save certificate files
-	err = fileManager.Write(ctx, cert.Certificate, []byte(clientCert))
-	require.NoError(t, err)
-	err = fileManager.Write(ctx, cert.PrivateKey, []byte(clientKey))
-	require.NoError(t, err)
-
-	// Create node pointing to mock server
-	node := &domain.Node{
-		Enabled:             true,
-		Name:                "Test Node with Mock Daemon",
-		OS:                  "linux",
-		Location:            "test-location",
-		WorkPath:            "/srv/gameap",
-		GdaemonHost:         mockServer.Host(),
-		GdaemonPort:         mockServer.Port(),
-		GdaemonAPIKey:       "test-key",
-		GdaemonServerCert:   "certificates/server.crt",
-		ClientCertificateID: cert.ID,
-		PreferInstallMethod: "auto",
-	}
-	err = nodeRepo.Save(ctx, node)
-	require.NoError(t, err)
-	require.NotZero(t, node.ID)
-
-	// Save server certificate
-	err = fileManager.Write(ctx, node.GdaemonServerCert, []byte(daemonServerCert))
-	require.NoError(t, err)
-
-	// Create status service
-	statusService := NewStatusBINNService(certRepo, fileManager)
-
-	// Execute test
-	status, err := statusService.Status(ctx, node)
-
-	// Assert results
-	require.NoError(t, err)
-	assert.NotNil(t, status)
-	assert.Equal(t, "3.5.0-mock", status.Version)
-	assert.Equal(t, "2025-10-15", status.BuildDate)
-	assert.Equal(t, 5*time.Hour+20*time.Minute+30*time.Second, status.Uptime)
-	assert.Equal(t, 8, status.WorkingTasks)
-	assert.Equal(t, 12, status.WaitingTasks)
-	assert.Equal(t, 6, status.OnlineServers)
-	mockServer.AssertRequestCount(2)
-	mockServer.AssertAnyRequestEquals(binnapi.StatusRequestVersion)
-	mockServer.AssertAnyRequestEquals(binnapi.StatusRequestStatusBase)
+	require.NotNil(t, service, "service must be constructed")
+	assert.NotNil(t, service.logger, "logger must default to a non-nil instance when nil is passed")
 }

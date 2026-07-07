@@ -36,7 +36,7 @@
     </template>
 
     <template #header-extra>
-      <div class="flex flex-wrap gap-1.5">
+      <div class="flex flex-wrap gap-1.5 mr-10">
         <GButton
             color="blue"
             size="small"
@@ -44,10 +44,6 @@
         >
           <GIcon name="edit" class="mr-0.5" />
           <span>{{ trans('main.edit') }}</span>
-        </GButton>
-        <GButton color="orange" size="small" :disabled="downloading" @click="downloadLogs">
-          <GIcon name="download" class="mr-0.5" />
-          <span>{{ trans('dedicated_servers.download_logs') }}</span>
         </GButton>
         <GButton color="green" size="small" :disabled="downloading" @click="downloadCertificates">
           <GIcon name="certificate" class="mr-0.5" />
@@ -160,10 +156,6 @@ async function downloadFile(url, filename) {
         downloading.value = false
         downloadProgress.value = 0
     }
-}
-
-function downloadLogs() {
-    downloadFile(`/api/nodes/${props.nodeId}/logs.zip`, 'logs.zip')
 }
 
 function downloadCertificates() {

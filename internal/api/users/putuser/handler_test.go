@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gameap/gameap/internal/audit"
 	"github.com/gameap/gameap/internal/domain"
 	"github.com/gameap/gameap/internal/rbac"
 	"github.com/gameap/gameap/internal/repositories/inmemory"
@@ -21,11 +23,54 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// auditCapture is a concurrency-safe audit.Logger that records every event
+// the handler emits (mirrors router_security_auditlog_test.go).
+type auditCapture struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (a *auditCapture) Record(_ context.Context, e audit.Event) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.events = append(a.events, e)
+}
+
+func (a *auditCapture) snapshot() []audit.Event {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return append([]audit.Event(nil), a.events...)
+}
+
+func findEvent(events []audit.Event, t audit.EventType) (audit.Event, bool) {
+	for _, e := range events {
+		if e.Type == t {
+			return e, true
+		}
+	}
+
+	return audit.Event{}, false
+}
+
+func countEvents(events []audit.Event, t audit.EventType) int {
+	n := 0
+	for _, e := range events {
+		if e.Type == t {
+			n++
+		}
+	}
+
+	return n
+}
+
 var testUser1 = domain.User{
 	ID:    1,
 	Login: "admin",
 	Email: "admin@example.com",
 }
+
+const originalUserName = "Original User"
 
 func TestHandler_ServeHTTP(t *testing.T) {
 	tests := []struct {
@@ -59,7 +104,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			},
 			setupRepo: func(usersRepo *inmemory.UserRepository, rbacRepo *inmemory.RBACRepository) {
 				now := time.Now()
-				name := "Original User"
+				name := originalUserName
 
 				user := &domain.User{
 					ID:        1,
@@ -109,7 +154,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			},
 			setupRepo: func(usersRepo *inmemory.UserRepository, rbacRepo *inmemory.RBACRepository) {
 				now := time.Now()
-				name := "Original User"
+				name := originalUserName
 
 				user := &domain.User{
 					ID:        1,
@@ -286,7 +331,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			},
 			setupRepo:      func(_ *inmemory.UserRepository, _ *inmemory.RBACRepository) {},
 			expectedStatus: http.StatusBadRequest,
-			wantError:      "password must be at least 8 characters",
+			wantError:      "password must be at least 12 characters",
 			expectUser:     false,
 		},
 		{
@@ -334,6 +379,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				rbac.NewRBAC(services.NewNilTransactionManager(), rbacRepo, 0),
 				services.NewNilTransactionManager(),
 				responder,
+				nil,
 			)
 
 			if tt.setupRepo != nil {
@@ -395,6 +441,7 @@ func TestHandler_UpdateUserFields(t *testing.T) {
 		rbac.NewRBAC(services.NewNilTransactionManager(), rbacRepo, 0),
 		services.NewNilTransactionManager(),
 		responder,
+		nil,
 	)
 
 	now := time.Now()
@@ -462,6 +509,66 @@ func TestHandler_UpdateUserFields(t *testing.T) {
 	assert.NotNil(t, userResp.UpdatedAt)
 	require.NotNil(t, userResp.Roles)
 	assert.Contains(t, userResp.Roles, "admin")
+
+	// An admin password change (input.Apply) must stamp password_changed_at on
+	// the persisted user so every credential issued before it is invalidated.
+	storedUsers, err := usersRepo.FindAll(context.Background(), nil, nil)
+	require.NoError(t, err)
+	require.Len(t, storedUsers, 1)
+	changedAt := storedUsers[0].PasswordChangedAt()
+	require.NotNil(t, changedAt, "updating the password must stamp password_changed_at")
+	assert.WithinDuration(t, time.Now(), *changedAt, 5*time.Second)
+}
+
+// TestHandler_UpdateUser_WithoutPasswordDoesNotStampChangedAt pins the
+// complementary contract: an admin update that does NOT change the password
+// (empty password field means "no change") must leave password_changed_at
+// untouched, so unrelated profile edits don't invalidate the user's sessions.
+func TestHandler_UpdateUser_WithoutPasswordDoesNotStampChangedAt(t *testing.T) {
+	// ARRANGE
+	usersRepo := inmemory.NewUserRepository()
+	userService := services.NewUserService(usersRepo)
+	rbacRepo := inmemory.NewRBACRepository()
+	serversRepo := inmemory.NewServerRepository()
+	handler := NewHandler(
+		userService,
+		serversRepo,
+		rbac.NewRBAC(services.NewNilTransactionManager(), rbacRepo, 0),
+		services.NewNilTransactionManager(),
+		api.NewResponder(),
+		nil,
+	)
+
+	now := time.Now()
+	name := originalUserName
+	require.NoError(t, usersRepo.Save(context.Background(), &domain.User{
+		ID:        1,
+		Login:     "originaluser",
+		Email:     "original@example.com",
+		Password:  "$2a$10$test",
+		Name:      &name,
+		CreatedAt: &now,
+		UpdatedAt: &now,
+	}))
+
+	// ACT — update email/name only; empty password means "no change".
+	w := doPutUser(t, handler, updateUserInput{
+		Email:    "updated@example.com",
+		Name:     new("Updated User"),
+		Password: new(""),
+		Roles:    []string{},
+		Servers:  []flexible.Uint{},
+	})
+
+	// ASSERT
+	require.Equal(t, http.StatusOK, w.Code, "update must succeed; body=%s", w.Body.String())
+
+	storedUsers, err := usersRepo.FindAll(context.Background(), nil, nil)
+	require.NoError(t, err)
+	require.Len(t, storedUsers, 1)
+	assert.Equal(t, "updated@example.com", storedUsers[0].Email, "the non-password fields must still be updated")
+	assert.Nil(t, storedUsers[0].PasswordChangedAt(),
+		"an update that does not change the password must not stamp password_changed_at")
 }
 
 func TestNewUserResponseFromUser(t *testing.T) {
@@ -510,4 +617,136 @@ func TestNewUserResponseFromUser_NoRoles(t *testing.T) {
 	assert.Nil(t, response.Name)
 	assert.NotNil(t, response.Roles)
 	assert.Empty(t, response.Roles)
+}
+
+// ---------------------------------------------------------------------------
+// Security audit-trail tests.
+//
+// OWASP API Security Top 10:2023:
+//   - API8:2023 Security Misconfiguration — an administrative user mutation
+//     (and especially a role assignment, a privilege change) that succeeds
+//     without being recorded is a detective-control gap (OWASP ASVS §7.2.1).
+//     The events must be scoped to the target user and attributed to the
+//     acting principal.
+//
+// Reference: https://owasp.org/API-Security/editions/2023/
+// ---------------------------------------------------------------------------
+
+func setupPutUserAudit(t *testing.T) (*Handler, *auditCapture) {
+	t.Helper()
+
+	usersRepo := inmemory.NewUserRepository()
+	userService := services.NewUserService(usersRepo)
+	rbacRepo := inmemory.NewRBACRepository()
+	serversRepo := inmemory.NewServerRepository()
+	recorder := &auditCapture{}
+	handler := NewHandler(
+		userService,
+		serversRepo,
+		rbac.NewRBAC(services.NewNilTransactionManager(), rbacRepo, 0),
+		services.NewNilTransactionManager(),
+		api.NewResponder(),
+		recorder,
+	)
+
+	now := time.Now()
+	name := originalUserName
+	require.NoError(t, usersRepo.Save(context.Background(), &domain.User{
+		ID:        1,
+		Login:     "originaluser",
+		Email:     "original@example.com",
+		Password:  "$2a$10$test",
+		Name:      &name,
+		CreatedAt: &now,
+		UpdatedAt: &now,
+	}))
+	require.NoError(t, rbacRepo.SaveRole(context.Background(), &domain.Role{Name: "user"}))
+
+	return handler, recorder
+}
+
+func doPutUser(t *testing.T, handler *Handler, body any) *httptest.ResponseRecorder {
+	t.Helper()
+
+	bodyBytes, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/users/1", bytes.NewReader(bodyBytes))
+	req = req.WithContext(auth.ContextWithSession(context.Background(), &auth.Session{
+		Login: "admin",
+		Email: "admin@example.com",
+		User:  &testUser1,
+	}))
+	req = mux.SetURLVars(req, map[string]string{"id": "1"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	return w
+}
+
+// TestHandler_Audit_UserUpdateWithRolesEmitsBothEvents covers OWASP
+// API8:2023. Updating a user while supplying roles must emit a user.update
+// event AND a user.roles.assign event, both with outcome success, category
+// admin_op, scoped to the target user, and attributed to the acting admin.
+func TestHandler_Audit_UserUpdateWithRolesEmitsBothEvents(t *testing.T) {
+	// ARRANGE
+	handler, recorder := setupPutUserAudit(t)
+
+	// ACT
+	w := doPutUser(t, handler, updateUserInput{
+		Email:   "updated@example.com",
+		Name:    new("Updated User"),
+		Roles:   []string{"user"},
+		Servers: []flexible.Uint{},
+	})
+
+	// ASSERT
+	require.Equal(t, http.StatusOK, w.Code, "update must succeed; body=%s", w.Body.String())
+
+	events := recorder.snapshot()
+
+	upd, ok := findEvent(events, audit.EventUserUpdate)
+	require.True(t, ok, "a successful user update must leave a user.update audit event")
+	assert.Equal(t, audit.OutcomeSuccess, upd.Outcome)
+	assert.Equal(t, audit.CategoryAdminOp, upd.Category)
+	assert.Equal(t, "user", upd.ResourceType)
+	assert.Equal(t, "1", upd.ResourceID, "the updated user id must be recorded")
+	assert.Equal(t, "update", upd.Action)
+	assert.Equal(t, testUser1.ID, upd.ActorID, "the acting admin must be attributed as the actor")
+	assert.Equal(t, audit.AuthMethodSession, upd.AuthMethod)
+
+	roles, ok := findEvent(events, audit.EventUserRolesAssign)
+	require.True(t, ok, "supplying roles must leave a user.roles.assign audit event")
+	assert.Equal(t, audit.OutcomeSuccess, roles.Outcome)
+	assert.Equal(t, audit.CategoryAdminOp, roles.Category)
+	assert.Equal(t, "user", roles.ResourceType)
+	assert.Equal(t, "1", roles.ResourceID)
+	assert.Equal(t, "role_assign", roles.Action)
+	assert.Equal(t, testUser1.ID, roles.ActorID)
+}
+
+// TestHandler_Audit_UserUpdateWithoutRolesEmitsOnlyUpdate covers OWASP
+// API8:2023. Updating a user without supplying any roles must emit the
+// user.update event but must NOT emit a user.roles.assign event (the audit
+// trail must not claim a privilege change that did not happen).
+func TestHandler_Audit_UserUpdateWithoutRolesEmitsOnlyUpdate(t *testing.T) {
+	// ARRANGE
+	handler, recorder := setupPutUserAudit(t)
+
+	// ACT
+	w := doPutUser(t, handler, updateUserInput{
+		Email:   "updated@example.com",
+		Name:    new("Updated User"),
+		Roles:   []string{},
+		Servers: []flexible.Uint{},
+	})
+
+	// ASSERT
+	require.Equal(t, http.StatusOK, w.Code, "update must succeed; body=%s", w.Body.String())
+
+	events := recorder.snapshot()
+	assert.Equal(t, 1, countEvents(events, audit.EventUserUpdate),
+		"exactly one user.update event must be emitted")
+	assert.Equal(t, 0, countEvents(events, audit.EventUserRolesAssign),
+		"no roles supplied means no user.roles.assign event may be recorded")
 }

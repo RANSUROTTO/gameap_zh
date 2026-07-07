@@ -23,12 +23,6 @@ info:
     Authorization: Bearer 42|abc123...xyz
     ```
 
-    ### Daemon Token
-    For `/gdaemon_api/*` endpoints. Assigned to each node for daemon-to-API communication.
-    ```
-    X-Auth-Token: daemon-api-token-here
-    ```
-
     ## Response Format
 
     ### Success Response
@@ -60,12 +54,26 @@ info:
     }
     ```
 
+    ## Request correlation
+
+    Every HTTP response carries an `X-Request-Id` header — a per-request
+    correlation ID. If the client sends an `X-Request-Id` request header
+    with a short, safe value (≤ 64 chars, `[A-Za-z0-9._-]`) it is echoed
+    back; otherwise the server generates one. The same ID appears in the
+    server-side structured audit log, so a client can quote it when
+    reporting an issue.
+
     ## WebSocket endpoints
 
     OpenAPI does not natively model WebSocket flows; this section documents
-    them informally. All WS endpoints accept the same Bearer token via the
-    `?token=` query parameter (the browser does not allow setting headers
-    on a WebSocket upgrade). Outbound frames are JSON
+    them informally. WS endpoints take the token via the `?token=` query
+    parameter (the browser does not allow setting headers on a WebSocket
+    upgrade). Mint a **single-use, short-lived** token with
+    `POST /api/auth/short-lived-token` and use that — never a long-lived
+    token — in the URL, so the credential cannot be replayed from proxy
+    logs or browser history. Fetch a fresh one before every (re)connection.
+    A long-lived Bearer/PAT is still accepted for non-browser clients.
+    Outbound frames are JSON
     `{"type": string, "payload": any, "ts": int64}` envelopes.
 
     ### `/api/ws/nodes/metrics` (admin only)
@@ -279,12 +287,6 @@ components:
       scheme: bearer
       description: Personal Access Token in format {id}|{token}
 
-    daemonToken:
-      type: apiKey
-      in: header
-      name: X-Auth-Token
-      description: Daemon authentication token for /gdaemon_api/* endpoints
-
   schemas:
     $ref: './schemas/_index.yaml'
 
@@ -307,12 +309,26 @@ paths:
     $ref: './paths/auth.yaml#/~1api~1auth~1login'
   /api/auth/logout:
     $ref: './paths/auth.yaml#/~1api~1auth~1logout'
+  /api/auth/short-lived-token:
+    $ref: './paths/auth.yaml#/~1api~1auth~1short-lived-token'
+  /api/auth/2fa/verify:
+    $ref: './paths/auth.yaml#/~1api~1auth~12fa~1verify'
 
   # User & Profile
   /api/user:
     $ref: './paths/user.yaml#/~1api~1user'
   /api/profile:
     $ref: './paths/profile.yaml#/~1api~1profile'
+  /api/profile/2fa/setup:
+    $ref: './paths/profile-twofactor.yaml#/~1api~1profile~12fa~1setup'
+  /api/profile/2fa/confirm:
+    $ref: './paths/profile-twofactor.yaml#/~1api~1profile~12fa~1confirm'
+  /api/profile/2fa:
+    $ref: './paths/profile-twofactor.yaml#/~1api~1profile~12fa'
+  /api/profile/2fa/recovery-codes:
+    $ref: './paths/profile-twofactor.yaml#/~1api~1profile~12fa~1recovery-codes'
+  /api/profile/2fa/snooze:
+    $ref: './paths/profile-twofactor.yaml#/~1api~1profile~12fa~1snooze'
 
   # Tokens
   /api/tokens:
@@ -377,6 +393,8 @@ paths:
     $ref: './paths/servers-tasks.yaml#/~1api~1servers~1{server}~1tasks'
   /api/servers/{server}/tasks/{id}:
     $ref: './paths/servers-tasks.yaml#/~1api~1servers~1{server}~1tasks~1{id}'
+  /api/servers/{server}/tasks/{id}/executions:
+    $ref: './paths/servers-tasks.yaml#/~1api~1servers~1{server}~1tasks~1{id}~1executions'
 
   # Server Settings
   /api/servers/{server}/settings:
@@ -536,32 +554,6 @@ paths:
   /api/admin/letsencrypt/status:
     $ref: './paths/admin-letsencrypt.yaml#/~1api~1admin~1letsencrypt~1status'
 
-  # Daemon Setup
-  /gdaemon/setup/{token}:
-    $ref: './paths/gdaemon-setup.yaml#/~1gdaemon~1setup~1{token}'
-  /gdaemon/create/{token}:
-    $ref: './paths/gdaemon-setup.yaml#/~1gdaemon~1create~1{token}'
+  # Daemon Enrollment
   /nodes/setup/{key}:
     $ref: './paths/nodes-enrollment-script.yaml#/~1nodes~1setup~1{key}'
-
-  # Daemon API
-  /gdaemon_api/get_token:
-    $ref: './paths/gdaemon-api-init.yaml#/~1gdaemon_api~1get_token'
-  /gdaemon_api/dedicated_servers/get_init_data/{node}:
-    $ref: './paths/gdaemon-api-init.yaml#/~1gdaemon_api~1dedicated_servers~1get_init_data~1{node}'
-  /gdaemon_api/servers:
-    $ref: './paths/gdaemon-api-servers.yaml#/~1gdaemon_api~1servers'
-  /gdaemon_api/servers/{server}:
-    $ref: './paths/gdaemon-api-servers.yaml#/~1gdaemon_api~1servers~1{server}'
-  /gdaemon_api/tasks:
-    $ref: './paths/gdaemon-api-tasks.yaml#/~1gdaemon_api~1tasks'
-  /gdaemon_api/tasks/{gdaemon_task}:
-    $ref: './paths/gdaemon-api-tasks.yaml#/~1gdaemon_api~1tasks~1{gdaemon_task}'
-  /gdaemon_api/tasks/{gdaemon_task}/output:
-    $ref: './paths/gdaemon-api-tasks.yaml#/~1gdaemon_api~1tasks~1{gdaemon_task}~1output'
-  /gdaemon_api/servers_tasks:
-    $ref: './paths/gdaemon-api-servers-tasks.yaml#/~1gdaemon_api~1servers_tasks'
-  /gdaemon_api/servers_tasks/{server_task}:
-    $ref: './paths/gdaemon-api-servers-tasks.yaml#/~1gdaemon_api~1servers_tasks~1{server_task}'
-  /gdaemon_api/servers_tasks/{server_task}/fail:
-    $ref: './paths/gdaemon-api-servers-tasks.yaml#/~1gdaemon_api~1servers_tasks~1{server_task}~1fail'

@@ -1,6 +1,7 @@
 package deleteservertask
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gameap/gameap/internal/api/base"
@@ -13,10 +14,15 @@ import (
 	"github.com/pkg/errors"
 )
 
+type Dispatcher interface {
+	DispatchDelete(ctx context.Context, taskID uint64, nodeID uint64, version uint64) error
+}
+
 type Handler struct {
 	serverTasksRepo repositories.ServerTaskRepository
 	serverFinder    *serversbase.ServerFinder
 	abilityChecker  *serversbase.AbilityChecker
+	dispatcher      Dispatcher
 	responder       base.Responder
 }
 
@@ -24,12 +30,14 @@ func NewHandler(
 	serverTasksRepo repositories.ServerTaskRepository,
 	serversRepo repositories.ServerRepository,
 	rbac base.RBAC,
+	dispatcher Dispatcher,
 	responder base.Responder,
 ) *Handler {
 	return &Handler{
 		serverTasksRepo: serverTasksRepo,
 		serverFinder:    serversbase.NewServerFinder(serversRepo, rbac),
 		abilityChecker:  serversbase.NewAbilityChecker(rbac),
+		dispatcher:      dispatcher,
 		responder:       responder,
 	}
 }
@@ -112,11 +120,19 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.serverTasksRepo.Delete(ctx, taskID)
+	existing := &tasks[0]
+
+	err = h.serverTasksRepo.SoftDelete(ctx, taskID)
 	if err != nil {
 		h.responder.WriteError(ctx, rw, errors.WithMessage(err, "failed to delete server task"))
 
 		return
+	}
+
+	if h.dispatcher != nil && existing.NodeID != nil {
+		_ = h.dispatcher.DispatchDelete(
+			ctx, uint64(taskID), uint64(*existing.NodeID), existing.Version+1,
+		)
 	}
 
 	rw.WriteHeader(http.StatusNoContent)

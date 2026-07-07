@@ -12,24 +12,11 @@ import (
 	"github.com/gameap/gameap/internal/acme/http01"
 	"github.com/gameap/gameap/internal/api/auth/login"
 	"github.com/gameap/gameap/internal/api/auth/logout"
+	"github.com/gameap/gameap/internal/api/auth/shorttoken"
+	"github.com/gameap/gameap/internal/api/auth/twofactorverify"
 	"github.com/gameap/gameap/internal/api/clientcertificates/deleteclientcertificates"
 	"github.com/gameap/gameap/internal/api/clientcertificates/getclientcertificates"
 	"github.com/gameap/gameap/internal/api/clientcertificates/postclientcertificates"
-	"github.com/gameap/gameap/internal/api/daemon/createnode"
-	"github.com/gameap/gameap/internal/api/daemon/daemonsetup"
-	"github.com/gameap/gameap/internal/api/daemonapi/getinitdata"
-	daemonapiinit "github.com/gameap/gameap/internal/api/daemonapi/gettoken"
-	daemonapigetserverid "github.com/gameap/gameap/internal/api/daemonapi/servers/getserverid"
-	daemonapigetservers "github.com/gameap/gameap/internal/api/daemonapi/servers/getservers"
-	daemonapipatchservers "github.com/gameap/gameap/internal/api/daemonapi/servers/patchservers"
-	daemonapiputserver "github.com/gameap/gameap/internal/api/daemonapi/servers/putserver"
-	daemonapifailservertask "github.com/gameap/gameap/internal/api/daemonapi/serverstasks/failservertask"
-	daemonapiserverstasks "github.com/gameap/gameap/internal/api/daemonapi/serverstasks/getserverstasks"
-	daemonapigetservertask "github.com/gameap/gameap/internal/api/daemonapi/serverstasks/getservertask"
-	daemonapiupdateservertask "github.com/gameap/gameap/internal/api/daemonapi/serverstasks/updateservertask"
-	daemonapiappendoutput "github.com/gameap/gameap/internal/api/daemonapi/tasks/appendoutput"
-	daemonapitasks "github.com/gameap/gameap/internal/api/daemonapi/tasks/gettask"
-	daemonapiupdatetask "github.com/gameap/gameap/internal/api/daemonapi/tasks/updatetask"
 	"github.com/gameap/gameap/internal/api/daemontasks/canceldaemontask"
 	"github.com/gameap/gameap/internal/api/daemontasks/getdaemontask"
 	"github.com/gameap/gameap/internal/api/daemontasks/getdaemontasks"
@@ -40,6 +27,7 @@ import (
 	filemanagerdelete "github.com/gameap/gameap/internal/api/filemanager/delete"
 	filemanagerdownload "github.com/gameap/gameap/internal/api/filemanager/download"
 	filemanagerdownloadarchive "github.com/gameap/gameap/internal/api/filemanager/downloadarchive"
+	"github.com/gameap/gameap/internal/api/filemanager/filemanagermime"
 	"github.com/gameap/gameap/internal/api/filemanager/initialize"
 	filemanagerpaste "github.com/gameap/gameap/internal/api/filemanager/paste"
 	filemanagerrename "github.com/gameap/gameap/internal/api/filemanager/rename"
@@ -100,7 +88,13 @@ import (
 	"github.com/gameap/gameap/internal/api/pluginstore/updateplugin"
 	"github.com/gameap/gameap/internal/api/profile/getprofile"
 	"github.com/gameap/gameap/internal/api/profile/putprofile"
+	twofactorconfirm "github.com/gameap/gameap/internal/api/profile/twofactor/confirm"
+	twofactordisable "github.com/gameap/gameap/internal/api/profile/twofactor/disable"
+	twofactorrecoverycodes "github.com/gameap/gameap/internal/api/profile/twofactor/recoverycodes"
+	twofactorsetup "github.com/gameap/gameap/internal/api/profile/twofactor/setup"
+	twofactorsnooze "github.com/gameap/gameap/internal/api/profile/twofactor/snooze"
 	"github.com/gameap/gameap/internal/api/publicconfig"
+	serversbase "github.com/gameap/gameap/internal/api/servers/base"
 	"github.com/gameap/gameap/internal/api/servers/deleteserver"
 	"github.com/gameap/gameap/internal/api/servers/getabilities"
 	"github.com/gameap/gameap/internal/api/servers/getconsole"
@@ -123,6 +117,7 @@ import (
 	"github.com/gameap/gameap/internal/api/serversettings/getserversettings"
 	"github.com/gameap/gameap/internal/api/serversettings/putserversettings"
 	"github.com/gameap/gameap/internal/api/servertasks/deleteservertask"
+	"github.com/gameap/gameap/internal/api/servertasks/getservertaskexecutions"
 	"github.com/gameap/gameap/internal/api/servertasks/getservertasks"
 	"github.com/gameap/gameap/internal/api/servertasks/postservertask"
 	"github.com/gameap/gameap/internal/api/servertasks/putservertask"
@@ -145,6 +140,7 @@ import (
 	wsnodesmetrics "github.com/gameap/gameap/internal/api/ws/nodesmetrics"
 	wsservermetrics "github.com/gameap/gameap/internal/api/ws/servermetrics"
 	wstaskstatus "github.com/gameap/gameap/internal/api/ws/taskstatus"
+	"github.com/gameap/gameap/internal/audit"
 	"github.com/gameap/gameap/internal/cache"
 	"github.com/gameap/gameap/internal/certificates"
 	"github.com/gameap/gameap/internal/config"
@@ -162,13 +158,16 @@ import (
 	"github.com/gameap/gameap/internal/repositories"
 	"github.com/gameap/gameap/internal/repositories/base"
 	"github.com/gameap/gameap/internal/services"
+	"github.com/gameap/gameap/internal/services/captcha"
 	"github.com/gameap/gameap/internal/services/filemanager/archiver"
 	"github.com/gameap/gameap/internal/services/gameapimporter"
 	"github.com/gameap/gameap/internal/services/gameexporter"
+	"github.com/gameap/gameap/internal/services/mfanudge"
 	"github.com/gameap/gameap/internal/services/pelicaneggimporter"
 	"github.com/gameap/gameap/internal/services/pluginstore"
 	"github.com/gameap/gameap/internal/services/serverconfigpush"
 	"github.com/gameap/gameap/internal/services/servercontrol"
+	"github.com/gameap/gameap/internal/services/servertaskdispatcher"
 	"github.com/gameap/gameap/internal/services/taskdispatcher"
 	uploadservice "github.com/gameap/gameap/internal/upload"
 	"github.com/gameap/gameap/internal/ws"
@@ -176,6 +175,7 @@ import (
 	"github.com/gameap/gameap/pkg/auth"
 	"github.com/gameap/gameap/pkg/plugin"
 	"github.com/gameap/gameap/pkg/secret"
+	"github.com/gameap/gameap/pkg/twofactor"
 	webstatic "github.com/gameap/gameap/web/static"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
@@ -192,7 +192,9 @@ type container interface {
 	ServerRepository() repositories.ServerRepository
 	UserRepository() repositories.UserRepository
 	AuthService() auth.Service
+	TwoFactorManager() *twofactor.Manager
 	UserService() *services.UserService
+	MFANudgeService() *mfanudge.Service
 	ServerControlService() *servercontrol.Service
 	GameUpgradeService() *services.GameUpgradeService
 	PelicanEggImporter() *pelicaneggimporter.Importer
@@ -202,7 +204,7 @@ type container interface {
 	PersonalAccessTokenRepository() repositories.PersonalAccessTokenRepository
 	DaemonTaskRepository() repositories.DaemonTaskRepository
 	ServerTaskRepository() repositories.ServerTaskRepository
-	ServerTaskFailRepository() repositories.ServerTaskFailRepository
+	ServerTaskExecutionRepository() repositories.ServerTaskExecutionRepository
 	ServerSettingRepository() repositories.ServerSettingRepository
 	NodeRepository() repositories.NodeRepository
 	ClientCertificateRepository() repositories.ClientCertificateRepository
@@ -211,6 +213,7 @@ type container interface {
 	Cache() cache.Cache
 	CertificatesService() *certificates.Service
 	GlobalAPIService() *services.GlobalAPIService
+	CaptchaVerifier() *captcha.Service
 	DaemonStatus() *daemon.StatusService
 	DaemonFiles() *daemon.FileService
 	UploadSessionService() *uploadservice.Service
@@ -224,9 +227,9 @@ type container interface {
 	PluginStoreService() *pluginstore.Service
 	PluginsDir() string
 	TaskDispatcher() *taskdispatcher.Dispatcher
+	ServerTaskDispatcher() *servertaskdispatcher.Dispatcher
 	ServerConfigPusher() *serverconfigpush.Pusher
 	EnrollmentService() *enrollment.Service
-	EnrollmentServiceOrNil() *enrollment.Service
 	GRPCPort() uint16
 	GRPCExternalHost() string
 	GRPCExternalPort() uint16
@@ -237,9 +240,16 @@ type container interface {
 	MetricsHub() metrics.Hub
 	PubSub() pubsub.PubSub
 	ACMEService() *acme.Service
+	AuditLogger() audit.Logger
+	FileUploadMIMEChecker() *filemanagermime.Checker
 }
 
 func CreateRouter(c container) *http.ServeMux {
+	// Per-server ability checks are constructed inside ~38 handlers; install
+	// the process-wide audit sink once so every denial is logged without
+	// threading the logger through each handler.
+	serversbase.SetAuditLogger(c.AuditLogger())
+
 	serverMux := http.NewServeMux()
 
 	router := mux.NewRouter().StrictSlash(true)
@@ -247,10 +257,7 @@ func CreateRouter(c container) *http.ServeMux {
 	serverMux.Handle("/api/",
 		handlers.HTTPMethodOverrideHandler(apiRoutes(c, router)),
 	)
-	setupRoutes := gdaemonSetupRoutes(c, router)
-	serverMux.Handle("/gdaemon/", setupRoutes)
-	serverMux.Handle("/nodes/", setupRoutes)
-	serverMux.Handle("/gdaemon_api/", gdaemonAPIRoutes(c, router))
+	serverMux.Handle("/nodes/", nodeEnrollRoutes(c, router))
 
 	if h := c.ACMEService().HTTP01Handler(); h != nil {
 		serverMux.Handle(http01.ChallengePathPrefix, h)
@@ -277,7 +284,9 @@ func frontendPluginsHandler(c container) http.Handler {
 		c.UserService(),
 		c.PersonalAccessTokenRepository(),
 		auth.NewCacheRevocation(c.Cache()),
+		c.Cache(),
 		c.Responder(),
+		c.AuditLogger(),
 	)
 
 	recoveryMiddleware := middlewares.NewRecoveryMiddleware(
@@ -295,7 +304,9 @@ func frontendPluginsStylesHandler(c container) http.Handler {
 		c.UserService(),
 		c.PersonalAccessTokenRepository(),
 		auth.NewCacheRevocation(c.Cache()),
+		c.Cache(),
 		c.Responder(),
+		c.AuditLogger(),
 	)
 
 	recoveryMiddleware := middlewares.NewRecoveryMiddleware(
@@ -367,12 +378,14 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 	)
 
 	routes := []struct {
-		Method            string
-		Path              string
-		Handler           http.Handler
-		AllowGuestAccess  bool
-		AdminOnly         bool
-		CheckPATAbilities []domain.PATAbility
+		Method                  string
+		Path                    string
+		Handler                 http.Handler
+		AllowGuestAccess        bool
+		AdminOnly               bool
+		AllowShortLivedToken    bool
+		AllowMFAEnrollmentToken bool
+		CheckPATAbilities       []domain.PATAbility
 	}{
 		{
 			Method:           http.MethodGet,
@@ -381,18 +394,48 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 			AllowGuestAccess: true,
 		},
 		{
-			Method:           http.MethodGet,
-			Path:             "/api/config/public",
-			Handler:          publicconfig.NewHandler(c.Config(), c.Responder()),
-			AllowGuestAccess: true,
+			Method:                  http.MethodGet,
+			Path:                    "/api/config/public",
+			Handler:                 publicconfig.NewHandler(c.Config(), c.Responder()),
+			AllowGuestAccess:        true,
+			AllowMFAEnrollmentToken: true,
 		},
 
 		// Auth
 		{
 			Method: http.MethodPost,
 			Path:   "/api/auth/login",
-			Handler: middlewares.NewLoginRateLimitMiddleware(c.Cache(), c.Responder()).Middleware(
-				login.NewHandler(c.AuthService(), c.UserService(), c.Responder()),
+			Handler: middlewares.NewLoginRateLimitMiddleware(
+				c.Cache(),
+				c.Responder(),
+				middlewares.WithLoginRateLimitAuditLogger(c.AuditLogger()),
+				middlewares.WithLoginRateLimitClientIPHeader(c.Config().Audit.ClientIPHeader),
+			).Middleware(
+				login.NewHandler(
+					c.AuthService(), c.UserService(), c.Cache(), c.Responder(), c.AuditLogger(),
+					c.CaptchaVerifier(),
+					c.MFANudgeService(), c.RBAC(), c.Config().Auth.MFAEnrollmentTokenTTL,
+				),
+			),
+			AllowGuestAccess: true,
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/api/auth/2fa/verify",
+			Handler: middlewares.NewLoginRateLimitMiddleware(
+				c.Cache(),
+				c.Responder(),
+				middlewares.WithLoginRateLimitAuditLogger(c.AuditLogger()),
+				middlewares.WithLoginRateLimitClientIPHeader(c.Config().Audit.ClientIPHeader),
+			).Middleware(
+				twofactorverify.NewHandler(
+					c.AuthService(),
+					c.UserService(),
+					c.TwoFactorManager(),
+					c.Cache(),
+					c.Responder(),
+					c.AuditLogger(),
+				),
 			),
 			AllowGuestAccess: true,
 		},
@@ -403,6 +446,17 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.AuthService(),
 				auth.NewCacheRevocation(c.Cache()),
 				c.Responder(),
+			),
+			AllowMFAEnrollmentToken: true,
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/api/auth/short-lived-token",
+			Handler: shorttoken.NewHandler(
+				c.Cache(),
+				c.Config().ShortLivedTokenTTL,
+				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 
@@ -419,14 +473,69 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 			Path:   "/api/profile",
 			Handler: getprofile.NewHandler(
 				c.RBACRepository(),
+				c.MFANudgeService(),
+				c.RBAC(),
 				c.Responder(),
 			),
+			AllowMFAEnrollmentToken: true,
 		},
 		{
 			Method: http.MethodPut,
 			Path:   "/api/profile",
 			Handler: putprofile.NewHandler(
 				c.UserService(),
+				c.AuthService(),
+				c.Responder(),
+			),
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/api/profile/2fa/setup",
+			Handler: twofactorsetup.NewHandler(
+				c.UserService(),
+				c.TwoFactorManager(),
+				c.Responder(),
+			),
+			AllowMFAEnrollmentToken: true,
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/api/profile/2fa/confirm",
+			Handler: twofactorconfirm.NewHandler(
+				c.UserService(),
+				c.TwoFactorManager(),
+				c.Responder(),
+				c.AuditLogger(),
+			),
+			AllowMFAEnrollmentToken: true,
+		},
+		{
+			Method: http.MethodDelete,
+			Path:   "/api/profile/2fa",
+			Handler: twofactordisable.NewHandler(
+				c.UserService(),
+				c.TwoFactorManager(),
+				c.Responder(),
+				c.AuditLogger(),
+			),
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/api/profile/2fa/recovery-codes",
+			Handler: twofactorrecoverycodes.NewHandler(
+				c.UserService(),
+				c.TwoFactorManager(),
+				c.Responder(),
+				c.AuditLogger(),
+			),
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/api/profile/2fa/snooze",
+			Handler: twofactorsnooze.NewHandler(
+				c.UserService(),
+				c.MFANudgeService(),
+				c.RBAC(),
 				c.Responder(),
 			),
 		},
@@ -447,6 +556,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.PersonalAccessTokenRepository(),
 				c.RBAC(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 		{
@@ -454,7 +564,9 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 			Path:   "/api/tokens/{id}",
 			Handler: deletetoken.NewHandler(
 				c.PersonalAccessTokenRepository(),
+				auth.NewCacheRevocation(c.Cache()),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 		{
@@ -739,6 +851,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.RBAC(),
 				c.DaemonFiles(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 		{
@@ -749,7 +862,9 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.NodeRepository(),
 				c.RBAC(),
 				c.DaemonFiles(),
+				c.FileUploadMIMEChecker(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 		{
@@ -807,6 +922,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.RBAC(),
 				c.DaemonFiles(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 		{
@@ -845,6 +961,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.RBAC(),
 				c.DaemonFiles(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 		{
@@ -856,6 +973,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.RBAC(),
 				c.DaemonFiles(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 		},
 		{
@@ -924,6 +1042,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.ServerTaskRepository(),
 				c.ServerRepository(),
 				c.RBAC(),
+				c.ServerTaskDispatcher(),
 				c.Responder(),
 			),
 			CheckPATAbilities: []domain.PATAbility{
@@ -937,6 +1056,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.ServerTaskRepository(),
 				c.ServerRepository(),
 				c.RBAC(),
+				c.ServerTaskDispatcher(),
 				c.Responder(),
 			),
 			CheckPATAbilities: []domain.PATAbility{
@@ -948,6 +1068,21 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 			Path:   "/api/servers/{server}/tasks/{id}",
 			Handler: deleteservertask.NewHandler(
 				c.ServerTaskRepository(),
+				c.ServerRepository(),
+				c.RBAC(),
+				c.ServerTaskDispatcher(),
+				c.Responder(),
+			),
+			CheckPATAbilities: []domain.PATAbility{
+				domain.PATAbilityServerTasksManage,
+			},
+		},
+		{
+			Method: http.MethodGet,
+			Path:   "/api/servers/{server}/tasks/{id}/executions",
+			Handler: getservertaskexecutions.NewHandler(
+				c.ServerTaskRepository(),
+				c.ServerTaskExecutionRepository(),
 				c.ServerRepository(),
 				c.RBAC(),
 				c.Responder(),
@@ -1132,6 +1267,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.RBAC(),
 				c.TransactionManager(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 			AdminOnly: true,
 		},
@@ -1188,7 +1324,8 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.CertificatesService(),
 				c.Responder(),
 			),
-			AdminOnly: true,
+			AdminOnly:            true,
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
@@ -1197,16 +1334,16 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.CertificatesService(),
 				c.Responder(),
 			),
-			AdminOnly: true,
+			AdminOnly:            true,
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
 			Path:   "/api/dedicated_servers/setup",
 			Handler: nodesetup.NewHandler(
-				c.Cache(),
 				c.Responder(),
 				"",
-				c.EnrollmentServiceOrNil(),
+				c.EnrollmentService(),
 				c.GRPCPort(),
 				c.GRPCExternalHost(),
 				c.GRPCExternalPort(),
@@ -1218,10 +1355,9 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 			// alias for /api/dedicated_servers/setup
 			Path: "/api/nodes/setup",
 			Handler: nodesetup.NewHandler(
-				c.Cache(),
 				c.Responder(),
 				"",
-				c.EnrollmentServiceOrNil(),
+				c.EnrollmentService(),
 				c.GRPCPort(),
 				c.GRPCExternalHost(),
 				c.GRPCExternalPort(),
@@ -1305,6 +1441,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.FileManager(),
 				c.SecretCipher(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 			AdminOnly: true,
 		},
@@ -1317,6 +1454,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.FileManager(),
 				c.SecretCipher(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 			AdminOnly: true,
 		},
@@ -1327,6 +1465,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.NodeRepository(),
 				c.ServerRepository(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 			AdminOnly: true,
 		},
@@ -1338,6 +1477,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.NodeRepository(),
 				c.ServerRepository(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 			AdminOnly: true,
 		},
@@ -1408,7 +1548,8 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.DaemonFiles(),
 				c.Responder(),
 			),
-			AdminOnly: true,
+			AdminOnly:            true,
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
@@ -1419,7 +1560,8 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.DaemonFiles(),
 				c.Responder(),
 			),
-			AdminOnly: true,
+			AdminOnly:            true,
+			AllowShortLivedToken: true,
 		},
 
 		// Games
@@ -1694,6 +1836,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.PluginManager(),
 				c.PluginsDir(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 			AdminOnly: true,
 		},
@@ -1718,6 +1861,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.PluginLoader(),
 				c.PluginsDir(),
 				c.Responder(),
+				c.AuditLogger(),
 			),
 			AdminOnly: true,
 		},
@@ -1745,6 +1889,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				wsOriginPatterns(c.Config()),
 				c.Responder(),
 			),
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
@@ -1758,10 +1903,10 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				c.SessionRegistry(),
 				c.CommandHandler(),
 				c.DaemonCommands(),
-				c.DaemonFiles(),
 				c.ConsoleLogService(),
 				c.Responder(),
 			),
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
@@ -1774,10 +1919,9 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				wsOriginPatterns(c.Config()),
 				c.SessionRegistry(),
 				c.AttachHandler(),
-				c.DaemonCommands(),
-				c.DaemonFiles(),
 				c.Responder(),
 			),
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
@@ -1790,7 +1934,8 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				wsOriginPatterns(c.Config()),
 				c.Responder(),
 			),
-			AdminOnly: true,
+			AdminOnly:            true,
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
@@ -1803,7 +1948,8 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				wsOriginPatterns(c.Config()),
 				c.Responder(),
 			),
-			AdminOnly: true,
+			AdminOnly:            true,
+			AllowShortLivedToken: true,
 		},
 		{
 			Method: http.MethodGet,
@@ -1816,6 +1962,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 				wsOriginPatterns(c.Config()),
 				c.Responder(),
 			),
+			AllowShortLivedToken: true,
 		},
 	}
 
@@ -1824,7 +1971,9 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 		c.UserService(),
 		c.PersonalAccessTokenRepository(),
 		auth.NewCacheRevocation(c.Cache()),
+		c.Cache(),
 		c.Responder(),
+		c.AuditLogger(),
 	)
 
 	corsMiddleware := middlewares.NewCORSMiddleware(c.Config())
@@ -1837,10 +1986,26 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 	isAdminMiddleware := middlewares.NewIsAdminMiddleware(
 		c.RBAC(),
 		c.Responder(),
+		c.AuditLogger(),
+	)
+
+	tokenAdminGuardMiddleware := middlewares.NewTokenAdminGuardMiddleware(
+		c.Responder(),
+		c.AuditLogger(),
 	)
 
 	recoveryMiddleware := middlewares.NewRecoveryMiddleware(
 		c.Responder(),
+	)
+
+	shortLivedScopeMiddleware := middlewares.NewShortLivedScopeMiddleware(
+		c.Responder(),
+		c.AuditLogger(),
+	)
+
+	mfaEnrollmentScopeMiddleware := middlewares.NewMFAEnrollmentScopeMiddleware(
+		c.Responder(),
+		c.AuditLogger(),
 	)
 
 	for _, r := range routes {
@@ -1854,7 +2019,24 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 
 		if r.AdminOnly {
 			handler = isAdminMiddleware.Middleware(handler)
+
+			// Fail closed: an admin route that does not explicitly check PAT
+			// abilities must not be reachable by a personal access token, whose
+			// declared scope would otherwise be bypassed (only the owner's RBAC
+			// role would be checked). Routes that opt into PAT access declare
+			// CheckPATAbilities and are handled by patMiddleware above.
+			if len(r.CheckPATAbilities) == 0 {
+				handler = tokenAdminGuardMiddleware.Middleware(handler)
+			}
 		}
+
+		// Runs right after auth (which sets the session): a short-lived
+		// token is only honoured on routes that opted in.
+		handler = shortLivedScopeMiddleware.Middleware(handler, r.AllowShortLivedToken)
+
+		// Same placement: an MFA-enrollment session is confined to the 2FA
+		// setup endpoints (and a few essentials) that opted in.
+		handler = mfaEnrollmentScopeMiddleware.Middleware(handler, r.AllowMFAEnrollmentToken)
 
 		if !r.AllowGuestAccess {
 			handler = authMiddleware.Middleware(handler)
@@ -1908,7 +2090,7 @@ func registerPluginRoutes(
 	router.Handle("/api/plugins/{plugin_id}", handler)
 }
 
-func gdaemonSetupRoutes(c container, router *mux.Router) *mux.Router {
+func nodeEnrollRoutes(c container, router *mux.Router) *mux.Router {
 	recoveryMiddleware := middlewares.NewRecoveryMiddleware(
 		c.Responder(),
 	)
@@ -1921,29 +2103,9 @@ func gdaemonSetupRoutes(c container, router *mux.Router) *mux.Router {
 	}{
 		{
 			Method: http.MethodGet,
-			Path:   "/gdaemon/setup/{token}",
-			Handler: daemonsetup.NewHandler(
-				c.Cache(),
-				c.Responder(),
-				"",
-			),
-		},
-		{
-			Method: http.MethodPost,
-			Path:   "/gdaemon/create/{token}",
-			Handler: createnode.NewHandler(
-				c.Cache(),
-				c.NodeRepository(),
-				c.ClientCertificateRepository(),
-				c.CertificatesService(),
-				c.Responder(),
-			),
-		},
-		{
-			Method: http.MethodGet,
 			Path:   "/nodes/setup/{key}",
 			Handler: enrollsetup.NewHandler(
-				c.EnrollmentServiceOrNil(),
+				c.EnrollmentService(),
 				c.Responder(),
 				"",
 				c.GRPCExternalHost(),
@@ -1960,212 +2122,6 @@ func gdaemonSetupRoutes(c container, router *mux.Router) *mux.Router {
 			handler = mw(handler)
 		}
 
-		// Recovery middleware wraps everything to catch panics
-		handler = recoveryMiddleware.Middleware(handler)
-
-		if handler != nil {
-			router.Handle(r.Path, handler).Methods(r.Method)
-		}
-	}
-
-	return router
-}
-
-//nolint:funlen
-func gdaemonAPIRoutes(c container, router *mux.Router) *mux.Router {
-	daemonAuthMiddleware := middlewares.NewDaemonAuthMiddleware(
-		c.NodeRepository(),
-		c.Responder(),
-	)
-
-	// The wrap loop below applies middleware entries in order, so the LAST
-	// entry becomes the outermost handler and runs first at request time.
-	// daemonAuthMiddleware must stay last in every slice so it populates the
-	// daemon session in context before daemonGRPCGuardMiddleware reads it.
-	daemonGRPCGuardMiddleware := middlewares.NewDaemonGRPCGuardMiddleware(
-		c.SessionRegistry(),
-		c.Responder(),
-	)
-
-	recoveryMiddleware := middlewares.NewRecoveryMiddleware(
-		c.Responder(),
-	)
-
-	routes := []struct {
-		Method      string
-		Path        string
-		Handler     http.Handler
-		Middlewares []mux.MiddlewareFunc
-	}{
-		{
-			Method:  http.MethodGet,
-			Path:    "/gdaemon_api/get_token",
-			Handler: daemonapiinit.NewHandler(c.NodeRepository(), c.SessionRegistry(), c.Responder()),
-		},
-		{
-			Method:  http.MethodGet,
-			Path:    "/gdaemon_api/dedicated_servers/get_init_data/{node}",
-			Handler: getinitdata.NewHandler(c.Responder()),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodGet,
-			Path:   "/gdaemon_api/servers",
-			Handler: daemonapigetservers.NewHandler(
-				c.ServerRepository(),
-				c.GameRepository(),
-				c.GameModRepository(),
-				c.ServerSettingRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodGet,
-			Path:   "/gdaemon_api/servers/{server}",
-			Handler: daemonapigetserverid.NewHandler(
-				c.ServerRepository(),
-				c.GameRepository(),
-				c.GameModRepository(),
-				c.ServerSettingRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodPut,
-			Path:   "/gdaemon_api/servers/{server}",
-			Handler: daemonapiputserver.NewHandler(
-				c.ServerRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodPatch,
-			Path:   "/gdaemon_api/servers",
-			Handler: daemonapipatchservers.NewHandler(
-				c.ServerRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodGet,
-			Path:   "/gdaemon_api/tasks",
-			Handler: daemonapitasks.NewHandler(
-				c.DaemonTaskRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodPut,
-			Path:   "/gdaemon_api/tasks/{gdaemon_task}",
-			Handler: daemonapiupdatetask.NewHandler(
-				c.DaemonTaskRepository(),
-				c.PubSub(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodPut,
-			Path:   "/gdaemon_api/tasks/{gdaemon_task}/output",
-			Handler: daemonapiappendoutput.NewHandler(
-				c.DaemonTaskRepository(),
-				c.PubSub(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodGet,
-			Path:   "/gdaemon_api/servers_tasks",
-			Handler: daemonapiserverstasks.NewHandler(
-				c.ServerTaskRepository(),
-				c.ServerRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodGet,
-			Path:   "/gdaemon_api/servers_tasks/{server_task}",
-			Handler: daemonapigetservertask.NewHandler(
-				c.ServerTaskRepository(),
-				c.ServerRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodPut,
-			Path:   "/gdaemon_api/servers_tasks/{server_task}",
-			Handler: daemonapiupdateservertask.NewHandler(
-				c.ServerTaskRepository(),
-				c.ServerRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-		{
-			Method: http.MethodPost,
-			Path:   "/gdaemon_api/servers_tasks/{server_task}/fail",
-			Handler: daemonapifailservertask.NewHandler(
-				c.ServerTaskRepository(),
-				c.ServerTaskFailRepository(),
-				c.ServerRepository(),
-				c.Responder(),
-			),
-			Middlewares: []mux.MiddlewareFunc{
-				daemonGRPCGuardMiddleware.Middleware,
-				daemonAuthMiddleware.Middleware,
-			},
-		},
-	}
-
-	for _, r := range routes {
-		handler := r.Handler
-
-		for _, mw := range r.Middlewares {
-			handler = mw(handler)
-		}
-
-		// Recovery middleware wraps everything to catch panics
 		handler = recoveryMiddleware.Middleware(handler)
 
 		if handler != nil {

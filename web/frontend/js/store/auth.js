@@ -8,6 +8,13 @@ export const useAuthStore = defineStore('auth', {
         // This is a counter to keep track of how many API processes are running
         apiProcesses: 0,
         authToken: null,
+        // Single-use ticket issued by /api/auth/login when the account has 2FA
+        // enabled. Kept in memory only (never localStorage): it is not a
+        // session, just a short-lived token to redeem at /api/auth/2fa/verify.
+        twoFactorChallengeToken: null,
+        // Admin-MFA nudge recommendation returned by login + /api/profile.
+        // Drives the "enable 2FA" enforcement modal. Null when no nudge applies.
+        mfaNudge: null,
     }),
     getters: {
         loading: (state) => state.apiProcesses > 0,
@@ -19,6 +26,9 @@ export const useAuthStore = defineStore('auth', {
         },
         user: (state) => {
             return state.profile
+        },
+        is2FAEnabled: (state) => {
+            return !!(state.profile && state.profile.two_factor_enabled)
         },
         canServerAbility: (state) => (serverId, ability) => {
             if (state.isAdmin) {
@@ -38,6 +48,7 @@ export const useAuthStore = defineStore('auth', {
             try {
                 const response = await axios.get('/api/profile')
                 this.profile = response.data
+                this.mfaNudge = response.data.mfa_nudge || null
             } catch (error) {
                 throw error
             } finally {
@@ -47,7 +58,17 @@ export const useAuthStore = defineStore('auth', {
         async saveProfile(profile) {
             this.apiProcesses++
             try {
-                await axios.put('/api/profile', profile)
+                const response = await axios.put('/api/profile', profile)
+
+                // A password change revokes every previously-issued session
+                // token, including the current one; the response then carries
+                // a fresh token that must replace it for the session to
+                // survive.
+                if (response.data.token) {
+                    this.authToken = response.data.token
+                    localStorage.setItem('auth_token', response.data.token)
+                    axios.defaults.headers.common['Authorization'] = `Bearer ${response.data.token}`
+                }
             } catch (error) {
                 throw error
             } finally {
@@ -65,6 +86,28 @@ export const useAuthStore = defineStore('auth', {
                 this.apiProcesses--
             }
         },
+        // Exchanges the long-lived token (sent in the Authorization header by
+        // the configured axios instance) for a single-use, short-lived token
+        // safe to put in a URL — used for WebSocket upgrades where the browser
+        // cannot set headers. Intentionally not counted in apiProcesses: it
+        // runs before every (re)connect and must not flicker the global
+        // loading indicator; the WS status store reflects connection state.
+        async fetchShortLivedToken() {
+            const response = await axios.post('/api/auth/short-lived-token')
+
+            return response.data.token
+        },
+        // applyAuthResponse stores the issued session token (state +
+        // localStorage + axios default header) and the returned user. Shared
+        // by the password login and the 2FA verification step.
+        applyAuthResponse(data) {
+            const { token, user } = data
+
+            this.authToken = token
+            localStorage.setItem('auth_token', token)
+            axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
+            this.profile = user
+        },
         async login(credentials) {
             this.apiProcesses++
             try {
@@ -74,25 +117,91 @@ export const useAuthStore = defineStore('auth', {
                     {withCredentials: true},
                 )
 
-                // Extract token from response
-                const { token, user } = response.data
+                if (response.data.two_factor_required) {
+                    this.twoFactorChallengeToken = response.data.challenge_token
 
-                // Store token in state
-                this.authToken = token
+                    return { twoFactorRequired: true }
+                }
 
-                // Save token to localStorage
-                localStorage.setItem('auth_token', token)
+                this.applyAuthResponse(response.data)
+                this.mfaNudge = response.data.mfa_nudge || null
 
-                // Set token as default Authorization header for all axios requests
-                axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
-
-                // Update user data
-                this.profile = user
+                return {
+                    twoFactorRequired: false,
+                    mfaEnrollmentRequired: !!response.data.mfa_enrollment_required,
+                }
             } catch (error) {
                 throw error
             } finally {
                 this.apiProcesses--
             }
+        },
+        async verifyTwoFactor(code) {
+            this.apiProcesses++
+            try {
+                const response = await axios.post(
+                    '/api/auth/2fa/verify',
+                    {
+                        challenge_token: this.twoFactorChallengeToken,
+                        code,
+                    },
+                    {withCredentials: true},
+                )
+
+                this.applyAuthResponse(response.data)
+                this.mfaNudge = response.data.mfa_nudge || null
+                this.twoFactorChallengeToken = null
+            } catch (error) {
+                throw error
+            } finally {
+                this.apiProcesses--
+            }
+        },
+        async setupTwoFactor() {
+            this.apiProcesses++
+            try {
+                const response = await axios.post('/api/profile/2fa/setup')
+
+                return response.data
+            } finally {
+                this.apiProcesses--
+            }
+        },
+        async confirmTwoFactor(code) {
+            this.apiProcesses++
+            try {
+                const response = await axios.post('/api/profile/2fa/confirm', { code })
+
+                return response.data
+            } finally {
+                this.apiProcesses--
+            }
+        },
+        async disableTwoFactor(password, code) {
+            this.apiProcesses++
+            try {
+                await axios.delete('/api/profile/2fa', { data: { password, code } })
+            } finally {
+                this.apiProcesses--
+            }
+        },
+        async regenerateRecoveryCodes(password) {
+            this.apiProcesses++
+            try {
+                const response = await axios.post('/api/profile/2fa/recovery-codes', { password })
+
+                return response.data
+            } finally {
+                this.apiProcesses--
+            }
+        },
+        // Dismisses the admin-MFA nudge for the snooze window (24h) and stores
+        // the recomputed recommendation so the enforcement modal hides.
+        async snoozeMfaNudge() {
+            const response = await axios.post('/api/profile/2fa/snooze')
+            this.mfaNudge = response.data.mfa_nudge || null
+
+            return this.mfaNudge
         },
         async logout() {
             // Clear token from state
@@ -106,6 +215,7 @@ export const useAuthStore = defineStore('auth', {
 
             // Clear user data
             this.profile = null
+            this.mfaNudge = null
         },
         async initializeAuth() {
             // Load token from localStorage

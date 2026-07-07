@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gameap/gameap/internal/domain"
 	"github.com/gameap/gameap/internal/repositories/inmemory"
@@ -27,6 +28,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 		expectedStatus int
 		wantError      string
 		expectSuccess  bool
+		expectToken    bool
 		validateUser   func(t *testing.T, repo *inmemory.UserRepository)
 	}{
 		{
@@ -35,6 +37,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -61,6 +64,8 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				require.Len(t, users, 1)
 				require.NotNil(t, users[0].Name)
 				assert.Equal(t, "Updated TokenName", *users[0].Name)
+				assert.Nil(t, users[0].PasswordChangedAt(),
+					"a name-only update must not stamp password_changed_at")
 			},
 		},
 		{
@@ -69,6 +74,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -86,15 +92,21 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			requestBody:    `{"password": "newpassword123", "current_password": "oldpassword"}`,
 			expectedStatus: http.StatusOK,
 			expectSuccess:  true,
+			expectToken:    true,
 			validateUser: func(t *testing.T, repo *inmemory.UserRepository) {
 				t.Helper()
 
 				users, err := repo.FindAll(context.Background(), nil, nil)
 				require.NoError(t, err)
 				require.Len(t, users, 1)
-				// Verify new password works
-				err = auth.VerifyPassword(users[0].Password, "newpassword123")
+				_, err = auth.VerifyPassword(users[0].Password, "newpassword123")
 				assert.NoError(t, err)
+
+				changedAt := users[0].PasswordChangedAt()
+				require.NotNil(t, changedAt,
+					"a password change must stamp password_changed_at so pre-existing credentials are invalidated")
+				assert.WithinDuration(t, time.Now(), *changedAt, 5*time.Second,
+					"the stamp must record the moment of the change")
 			},
 		},
 		{
@@ -103,6 +115,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -122,6 +135,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			requestBody:    `{"name": "New TokenName", "password": "newpassword123", "current_password": "oldpassword"}`,
 			expectedStatus: http.StatusOK,
 			expectSuccess:  true,
+			expectToken:    true,
 			validateUser: func(t *testing.T, repo *inmemory.UserRepository) {
 				t.Helper()
 
@@ -130,12 +144,31 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				require.Len(t, users, 1)
 				require.NotNil(t, users[0].Name)
 				assert.Equal(t, "New TokenName", *users[0].Name)
-				err = auth.VerifyPassword(users[0].Password, "newpassword123")
+				_, err = auth.VerifyPassword(users[0].Password, "newpassword123")
 				assert.NoError(t, err)
+
+				changedAt := users[0].PasswordChangedAt()
+				require.NotNil(t, changedAt,
+					"a combined name+password update must still stamp password_changed_at")
+				assert.WithinDuration(t, time.Now(), *changedAt, 5*time.Second)
 			},
 		},
 		{
 			name:           "user not authenticated",
+			setupRepo:      func(_ *inmemory.UserRepository) {},
+			requestBody:    `{"name": "Updated TokenName"}`,
+			expectedStatus: http.StatusUnauthorized,
+			wantError:      "user not authenticated",
+			expectSuccess:  false,
+		},
+		{
+			// A session object is present in context but carries no authenticated
+			// user (User is nil), so IsAuthenticated() is false and the request
+			// must be rejected exactly like a missing session.
+			name: "session present but unauthenticated",
+			setupAuth: func() context.Context {
+				return auth.ContextWithSession(context.Background(), &auth.Session{Login: "ghost"})
+			},
 			setupRepo:      func(_ *inmemory.UserRepository) {},
 			requestBody:    `{"name": "Updated TokenName"}`,
 			expectedStatus: http.StatusUnauthorized,
@@ -148,6 +181,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "nonexistent",
 					Email: "nonexistent@example.com",
+					User:  &domain.User{ID: 99, Login: "nonexistent", Email: "nonexistent@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -164,6 +198,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -187,6 +222,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -210,6 +246,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -233,6 +270,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -249,7 +287,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			},
 			requestBody:    `{"password": "short", "current_password": "oldpassword"}`,
 			expectedStatus: http.StatusBadRequest,
-			wantError:      "password must be at least 8 characters long",
+			wantError:      "password must be at least 12 characters long",
 			expectSuccess:  false,
 		},
 		{
@@ -258,6 +296,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -283,6 +322,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -308,6 +348,7 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				session := &auth.Session{
 					Login: "testuser",
 					Email: "test@example.com",
+					User:  &domain.User{ID: 1, Login: "testuser", Email: "test@example.com"},
 				}
 
 				return auth.ContextWithSession(context.Background(), session)
@@ -340,7 +381,8 @@ func TestHandler_ServeHTTP(t *testing.T) {
 			repo := inmemory.NewUserRepository()
 			userService := services.NewUserService(repo)
 			responder := api.NewResponder()
-			handler := NewHandler(userService, responder)
+			authService := auth.NewJWTService([]byte("test-secret-key-for-testing"))
+			handler := NewHandler(userService, authService, responder)
 
 			if tt.setupRepo != nil {
 				tt.setupRepo(repo)
@@ -374,6 +416,32 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				var response updateProfileResponse
 				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
 				assert.Equal(t, "Profile updated successfully", response.Message)
+
+				if tt.expectToken {
+					// A password change revokes every earlier token, including
+					// the caller's own session; the response must carry a
+					// fresh one that survives the password-changed cutoff.
+					require.NotEmpty(t, response.Token,
+						"a password change must re-issue a session token")
+
+					claims, err := authService.ValidateToken(response.Token)
+					require.NoError(t, err, "the re-issued token must be valid")
+
+					issuedAt, err := claims.GetIssuedAt()
+					require.NoError(t, err)
+					require.NotNil(t, issuedAt)
+
+					users, err := repo.FindAll(context.Background(), nil, nil)
+					require.NoError(t, err)
+					require.Len(t, users, 1)
+					changedAt := users[0].PasswordChangedAt()
+					require.NotNil(t, changedAt)
+					assert.False(t, issuedAt.Before(*changedAt),
+						"the re-issued token's iat must not precede the password-changed cutoff, or the auth middleware would reject it")
+				} else {
+					assert.Empty(t, response.Token,
+						"an update without a password change must not re-issue a token")
+				}
 			}
 
 			if tt.validateUser != nil {
@@ -433,15 +501,15 @@ func TestUpdateProfileInput_Validate(t *testing.T) {
 				Password:        new("short"),
 				CurrentPassword: new("currentpassword"),
 			},
-			wantError: "password must be at least 8 characters long",
+			wantError: "password must be at least 12 characters long",
 		},
 		{
 			name: "password too long",
 			input: updateProfileInput{
-				Password:        new(strings.Repeat("a", 65)),
+				Password:        new(strings.Repeat("a", 129)),
 				CurrentPassword: new("currentpassword"),
 			},
-			wantError: "password must not exceed 64 characters",
+			wantError: "password must not exceed 128 characters",
 		},
 		{
 			name: "empty password",
@@ -449,7 +517,7 @@ func TestUpdateProfileInput_Validate(t *testing.T) {
 				Password:        new(""),
 				CurrentPassword: new("currentpassword"),
 			},
-			wantError: "password cannot be empty",
+			wantError: "password is required",
 		},
 		{
 			name: "empty current password",

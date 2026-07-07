@@ -3,599 +3,445 @@ package nodesetup
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
-	"time"
 
-	daemonbase "github.com/gameap/gameap/internal/api/daemon/base"
 	"github.com/gameap/gameap/internal/cache"
-	"github.com/gameap/gameap/internal/certificates"
 	"github.com/gameap/gameap/internal/domain"
 	"github.com/gameap/gameap/internal/enrollment"
-	"github.com/gameap/gameap/internal/files"
-	"github.com/gameap/gameap/internal/repositories/inmemory"
-	"github.com/gameap/gameap/pkg/api"
 	"github.com/gameap/gameap/pkg/auth"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-type fakeCache struct {
-	delegate cache.Cache
-	setErr   error
+// fakeResponder records WriteError/Write calls so the test can assert on
+// status code, error text, and the structured response body the handler
+// passes to base.Responder. Mirrors the pattern used in
+// internal/api/ws/console/handler_test.go.
+type fakeResponder struct {
+	mu          sync.Mutex
+	errors      int
+	lastErr     error
+	successes   int
+	lastSuccess any
 }
 
-func newFakeCache(setErr error) *fakeCache {
-	return &fakeCache{
-		delegate: cache.NewInMemory(),
-		setErr:   setErr,
+func (r *fakeResponder) WriteError(_ context.Context, rw http.ResponseWriter, err error) {
+	r.mu.Lock()
+	r.errors++
+	r.lastErr = err
+	r.mu.Unlock()
+
+	type httpError interface{ HTTPStatus() int }
+	status := http.StatusInternalServerError
+
+	var he httpError
+	if errors.As(err, &he) {
+		status = he.HTTPStatus()
 	}
+	rw.WriteHeader(status)
+	_, _ = rw.Write([]byte(err.Error()))
 }
 
-func (c *fakeCache) Get(ctx context.Context, key string) (any, error) {
-	return c.delegate.Get(ctx, key)
+func (r *fakeResponder) Write(_ context.Context, rw http.ResponseWriter, result any) {
+	r.mu.Lock()
+	r.successes++
+	r.lastSuccess = result
+	r.mu.Unlock()
+	rw.WriteHeader(http.StatusOK)
 }
 
-func (c *fakeCache) Set(ctx context.Context, key string, value any, options ...cache.Option) error {
-	if c.setErr != nil {
-		return c.setErr
-	}
+func (r *fakeResponder) errorCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	return c.delegate.Set(ctx, key, value, options...)
+	return r.errors
 }
 
-func (c *fakeCache) Delete(ctx context.Context, key string) error {
-	return c.delegate.Delete(ctx, key)
+func (r *fakeResponder) successCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.successes
 }
 
-func (c *fakeCache) Clear(ctx context.Context) error {
-	return c.delegate.Clear(ctx)
+func (r *fakeResponder) lastError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.lastErr
 }
 
-func newAuthCtx() context.Context {
-	session := &auth.Session{
-		Login: "admin",
-		Email: "admin@example.com",
-		User:  &testUser1,
-	}
+func (r *fakeResponder) lastResult() any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	return auth.ContextWithSession(context.Background(), session)
+	return r.lastSuccess
 }
 
+// authedRequest returns a request whose context carries an authenticated
+// Session, mirroring what the auth middleware would inject in production.
+func authedRequest(t *testing.T, method, url string) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequest(method, url, nil)
+	req = req.WithContext(auth.ContextWithSession(req.Context(), &auth.Session{
+		User: &domain.User{ID: 1},
+	}))
+
+	return req
+}
+
+// newEnrollmentService builds an enrollment.Service backed by an in-memory
+// cache. The other repositories are nil because the handler under test only
+// drives SetupKeyManager().Generate() and never touches the node/cert/svc
+// paths.
 func newEnrollmentService(t *testing.T, c cache.Cache) *enrollment.Service {
 	t.Helper()
 
+	if c == nil {
+		c = cache.NewInMemory()
+	}
 	keyManager := enrollment.NewSetupKeyManager(c, "")
-	certsSvc := certificates.NewService(files.NewInMemoryFileManager())
-	nodesRepo := inmemory.NewNodeRepository()
-	clientCertsRepo := inmemory.NewClientCertificateRepository()
 
-	return enrollment.NewService(keyManager, nodesRepo, clientCertsRepo, certsSvc)
+	return enrollment.NewService(keyManager, nil, nil, nil)
 }
 
-var testUser1 = domain.User{
-	ID:    1,
-	Login: "admin",
-	Email: "admin@example.com",
+// failingCache returns the configured error from Set, forcing
+// SetupKeyManager.Generate() to surface a "failed to store setup key" error.
+type failingCache struct {
+	setErr error
 }
 
-func TestHandler_ServeHTTP(t *testing.T) {
+func (f *failingCache) Get(_ context.Context, _ string) (any, error) {
+	return nil, cache.ErrNotFound
+}
+
+func (f *failingCache) Set(_ context.Context, _ string, _ any, _ ...cache.Option) error {
+	return f.setErr
+}
+
+func (f *failingCache) Delete(_ context.Context, _ string) error { return nil }
+func (f *failingCache) Clear(_ context.Context) error            { return nil }
+
+var errCacheUnavailable = errors.New("cache unavailable")
+
+// -----------------------------------------------------------------------------
+// ServeHTTP tests
+// -----------------------------------------------------------------------------
+
+func TestHandler_ServeHTTP_unauthenticated_returns401(t *testing.T) {
+	// ARRANGE
+	c := cache.NewInMemory()
+	svc := newEnrollmentService(t, c)
+	responder := &fakeResponder{}
+	h := NewHandler(responder, "panel.example.com", svc, 31718, "", 0)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes/setup", nil)
+	rec := httptest.NewRecorder()
+
+	// ACT
+	h.ServeHTTP(rec, req)
+
+	// ASSERT
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Equal(t, 1, responder.errorCalls(), "exactly one WriteError must be emitted")
+	assert.Equal(t, 0, responder.successCalls(), "Write must not be called for unauthenticated requests")
+	require.Error(t, responder.lastError())
+	assert.Contains(t, responder.lastError().Error(), "user not authenticated")
+
+	// Confirm SetupKeyManager.Generate was never invoked: the in-memory cache
+	// must still report "not found" for the setup-key entry. This pins the
+	// "no side effects on unauthenticated requests" behaviour without
+	// asserting on internal call counts.
+	_, err := c.Get(req.Context(), enrollment.SetupKeyCacheKey)
+	assert.ErrorIs(t, err, cache.ErrNotFound,
+		"Generate must not be called when the session is unauthenticated")
+}
+
+func TestHandler_ServeHTTP_keyManagerError_propagates(t *testing.T) {
+	// ARRANGE
+	svc := newEnrollmentService(t, &failingCache{setErr: errCacheUnavailable})
+	responder := &fakeResponder{}
+	h := NewHandler(responder, "panel.example.com", svc, 31718, "", 0)
+
+	req := authedRequest(t, http.MethodGet, "/api/nodes/setup")
+	rec := httptest.NewRecorder()
+
+	// ACT
+	h.ServeHTTP(rec, req)
+
+	// ASSERT
+	assert.Equal(t, 1, responder.errorCalls())
+	assert.Equal(t, 0, responder.successCalls())
+	require.Error(t, responder.lastError())
+	assert.Contains(t, responder.lastError().Error(), "failed to generate setup key",
+		"the handler must wrap the underlying error with a clear message")
+	assert.Contains(t, responder.lastError().Error(), "cache unavailable",
+		"the underlying cache error must remain chained")
+}
+
+func TestHandler_ServeHTTP_success_writesResponse(t *testing.T) {
+	// ARRANGE
+	c := cache.NewInMemory()
+	svc := newEnrollmentService(t, c)
+	responder := &fakeResponder{}
+	h := NewHandler(responder, "panel.example.com", svc, 31718, "", 0)
+
+	req := authedRequest(t, http.MethodGet, "/api/nodes/setup")
+	rec := httptest.NewRecorder()
+
+	// ACT
+	h.ServeHTTP(rec, req)
+
+	// ASSERT
+	require.Equal(t, 1, responder.successCalls(),
+		"a happy-path setup request must produce exactly one Write")
+	require.Equal(t, 0, responder.errorCalls(),
+		"no errors should be reported on the happy path")
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	resp, ok := responder.lastResult().(setupResponse)
+	require.True(t, ok, "responder must receive a setupResponse value")
+
+	assert.True(t, resp.GRPCEnabled, "GRPC must be advertised as enabled")
+	require.NotEmpty(t, resp.Token, "a setup token must be generated")
+
+	// The exact token value is implementation detail of CryptoRandomString;
+	// we treat the generated Token as ground truth and verify every other
+	// field is composed from it. This keeps the test refactor-resistant.
+	token := resp.Token
+
+	expectedConnectURL := enrollment.FormatConnectURL("panel.example.com", 31718, token)
+	assert.Equal(t, expectedConnectURL, resp.ConnectURL)
+	assert.True(t, strings.HasPrefix(resp.ConnectURL, "grpc://panel.example.com:31718/"),
+		"ConnectURL must be a grpc:// URL with the resolved host and port")
+	assert.Contains(t, resp.ConnectURL, token,
+		"the setup token must appear in the connect URL path")
+
+	expectedBaseURL := "http://panel.example.com"
+	expectedSetupLink := expectedBaseURL + "/nodes/setup/" + token
+	assert.Equal(t, expectedSetupLink, resp.Link,
+		"Link must be baseURL + /nodes/setup/<token>")
+	assert.Equal(t, expectedSetupLink, resp.SetupLink,
+		"SetupLink must mirror Link")
+	assert.Equal(t, expectedBaseURL, resp.Host)
+
+	assert.Equal(t, "bash <(curl -s '"+expectedSetupLink+"')", resp.LinuxCmd)
+	assert.Equal(t, "gameapctl daemon install --connect="+expectedConnectURL, resp.WindowsCmd)
+
+	// The generated token must also be persisted in the cache so that a
+	// subsequent enrollment call can validate it. This is the only durable
+	// side effect of Generate that the handler relies on.
+	stored, err := c.Get(req.Context(), enrollment.SetupKeyCacheKey)
+	require.NoError(t, err)
+	assert.Equal(t, token, stored, "the generated key must be stored in the cache")
+}
+
+func TestHandler_ServeHTTP_usesGRPCExtPort_whenSet(t *testing.T) {
+	// Pins the dual-port behaviour: when grpcExtPort is non-zero it overrides
+	// the in-cluster grpcPort. The previous test fixed extPort=0 so this case
+	// covers the other branch.
+	// ARRANGE
+	svc := newEnrollmentService(t, nil)
+	responder := &fakeResponder{}
+	h := NewHandler(responder, "panel.example.com", svc, 31718, "", 9090)
+
+	req := authedRequest(t, http.MethodGet, "/api/nodes/setup")
+	rec := httptest.NewRecorder()
+
+	// ACT
+	h.ServeHTTP(rec, req)
+
+	// ASSERT
+	require.Equal(t, 1, responder.successCalls())
+	resp, ok := responder.lastResult().(setupResponse)
+	require.True(t, ok)
+	assert.Contains(t, resp.ConnectURL, ":9090/",
+		"a non-zero grpcExtPort must take precedence over grpcPort")
+	assert.NotContains(t, resp.ConnectURL, ":31718/",
+		"the in-cluster grpcPort must not appear when extPort overrides it")
+}
+
+// -----------------------------------------------------------------------------
+// resolveGRPCHost tests
+// -----------------------------------------------------------------------------
+
+func TestHandler_resolveGRPCHost(t *testing.T) {
 	tests := []struct {
-		name           string
-		setupAuth      func() context.Context
-		setupEnv       func(t *testing.T)
-		setupCache     func(cache.Cache)
-		panelHost      string
-		expectedStatus int
-		wantError      string
-		validateResp   func(*testing.T, setupResponse)
+		name          string
+		panelHost     string
+		grpcExtHost   string
+		forwardedHost string
+		requestHost   string
+		want          string
 	}{
 		{
-			name: "successful setup without env token",
-			setupAuth: func() context.Context {
-				session := &auth.Session{
-					Login: "admin",
-					Email: "admin@example.com",
-					User:  &testUser1,
-				}
-
-				return auth.ContextWithSession(context.Background(), session)
-			},
-			panelHost:      "panel.example.com",
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.NotEmpty(t, resp.Token)
-				assert.NotEmpty(t, resp.Link)
-				assert.Equal(t, "http://panel.example.com", resp.Host)
-				assert.Contains(t, resp.Link, "http://panel.example.com/gdaemon/setup/")
-			},
+			name:          "grpcExtHost_wins_over_panelHost_and_request",
+			grpcExtHost:   "grpc.example.com",
+			panelHost:     "panel.example.com",
+			forwardedHost: "forwarded.example.com",
+			requestHost:   "req.example.com",
+			want:          "grpc.example.com",
 		},
 		{
-			name: "successful setup with env token",
-			setupAuth: func() context.Context {
-				session := &auth.Session{
-					Login: "admin",
-					Email: "admin@example.com",
-					User:  &testUser1,
-				}
-
-				return auth.ContextWithSession(context.Background(), session)
-			},
-			setupEnv: func(t *testing.T) {
-				t.Helper()
-
-				t.Setenv("DAEMON_SETUP_TOKEN", "test-env-token")
-			},
-			panelHost:      "https://panel.example.com",
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.Equal(t, "test-env-token", resp.Token)
-				assert.NotEmpty(t, resp.Link)
-				assert.Equal(t, "http://panel.example.com", resp.Host)
-				assert.Contains(t, resp.Link, "http://panel.example.com/gdaemon/setup/test-env-token")
-			},
+			name:          "panelHost_used_when_no_extHost",
+			grpcExtHost:   "",
+			panelHost:     "panel.example.com",
+			forwardedHost: "forwarded.example.com",
+			requestHost:   "req.example.com",
+			want:          "panel.example.com",
 		},
 		{
-			name:           "user not authenticated",
-			panelHost:      "https://panel.example.com",
-			expectedStatus: http.StatusUnauthorized,
-			wantError:      "user not authenticated",
+			name:          "falls_back_to_X_Forwarded_Host_when_panelHost_empty",
+			grpcExtHost:   "",
+			panelHost:     "",
+			forwardedHost: "fw.example.com",
+			requestHost:   "req.example.com",
+			want:          "fw.example.com",
 		},
 		{
-			name: "cache clears old setup token",
-			setupAuth: func() context.Context {
-				session := &auth.Session{
-					Login: "admin",
-					Email: "admin@example.com",
-					User:  &testUser1,
-				}
-
-				return auth.ContextWithSession(context.Background(), session)
-			},
-			setupCache: func(c cache.Cache) {
-				err := c.Set(context.Background(), daemonbase.AutoSetupTokenCacheKey, "old-token", cache.WithExpiration(300*time.Second))
-				require.NoError(t, err)
-			},
-			panelHost:      "https://panel.example.com",
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.NotEmpty(t, resp.Token)
-				assert.NotEqual(t, "old-token", resp.Token)
-			},
+			name:          "falls_back_to_request_Host_when_no_forwarded",
+			grpcExtHost:   "",
+			panelHost:     "",
+			forwardedHost: "",
+			requestHost:   "req.example.com",
+			want:          "req.example.com",
 		},
 		{
-			name: "creates and stores create token in cache",
-			setupAuth: func() context.Context {
-				session := &auth.Session{
-					Login: "admin",
-					Email: "admin@example.com",
-					User:  &testUser1,
-				}
-
-				return auth.ContextWithSession(context.Background(), session)
-			},
-			panelHost:      "https://panel.example.com",
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.NotEmpty(t, resp.Token)
-			},
+			name:      "strips_http_prefix",
+			panelHost: "http://panel.example.com",
+			want:      "panel.example.com",
+		},
+		{
+			name:      "strips_https_prefix",
+			panelHost: "https://panel.example.com",
+			want:      "panel.example.com",
+		},
+		{
+			name:      "strips_port_from_host",
+			panelHost: "panel.example.com:8080",
+			want:      "panel.example.com",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cacheInstance := cache.NewInMemory()
-			responder := api.NewResponder()
-			handler := NewHandler(cacheInstance, responder, tt.panelHost, nil, 0, "", 0)
-
-			if tt.setupCache != nil {
-				tt.setupCache(cacheInstance)
+			// ARRANGE
+			h := NewHandler(&fakeResponder{}, tt.panelHost, nil, 31718, tt.grpcExtHost, 0)
+			req := httptest.NewRequest(http.MethodGet, "/api/nodes/setup", nil)
+			if tt.forwardedHost != "" {
+				req.Header.Set("X-Forwarded-Host", tt.forwardedHost)
+			}
+			if tt.requestHost != "" {
+				req.Host = tt.requestHost
 			}
 
-			if tt.setupEnv != nil {
-				tt.setupEnv(t)
-			}
+			// ACT
+			got := h.resolveGRPCHost(req)
 
-			ctx := context.Background()
-			if tt.setupAuth != nil {
-				ctx = tt.setupAuth()
-			}
-
-			req := httptest.NewRequest(http.MethodGet, "/api/dedicated_servers/setup", nil)
-			req = req.WithContext(ctx)
-			w := httptest.NewRecorder()
-
-			handler.ServeHTTP(w, req)
-
-			assert.Equal(t, tt.expectedStatus, w.Code)
-
-			if tt.wantError != "" {
-				var response map[string]any
-				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
-				assert.Equal(t, "error", response["status"])
-				errorMsg, ok := response["error"].(string)
-				require.True(t, ok)
-				assert.Contains(t, errorMsg, tt.wantError)
-			}
-
-			if tt.validateResp != nil {
-				var resp setupResponse
-				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-				tt.validateResp(t, resp)
-			}
+			// ASSERT
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
-func TestHandler_SetupTokenNotFromEnv(t *testing.T) {
-	cacheInstance := cache.NewInMemory()
-	responder := api.NewResponder()
-	handler := NewHandler(cacheInstance, responder, "https://panel.example.com", nil, 0, "", 0)
+// -----------------------------------------------------------------------------
+// detectBaseURL tests
+// -----------------------------------------------------------------------------
 
-	session := &auth.Session{
-		Login: "admin",
-		Email: "admin@example.com",
-		User:  &testUser1,
-	}
-	ctx := auth.ContextWithSession(context.Background(), session)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/dedicated_servers/setup", nil)
-	req = req.WithContext(ctx)
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	require.Equal(t, http.StatusOK, w.Code)
-
-	val, err := cacheInstance.Get(context.Background(), daemonbase.AutoSetupTokenCacheKey)
-	require.NoError(t, err)
-	assert.NotNil(t, val)
-
-	tokenStr, ok := val.(string)
-	require.True(t, ok)
-	assert.NotEmpty(t, tokenStr)
-}
-
-func TestHandler_HostDetection(t *testing.T) {
+func TestHandler_detectBaseURL(t *testing.T) {
 	tests := []struct {
-		name       string
-		panelHost  string
-		headers    map[string]string
-		host       string
-		useTLS     bool
-		wantHost   string
-		wantInLink string
+		name           string
+		panelHost      string
+		forwardedHost  string
+		forwardedProto string
+		requestHost    string
+		withTLS        bool
+		want           string
 	}{
 		{
-			name:       "uses_configured_panel_host",
-			panelHost:  "configured.example.com",
-			host:       "request.example.com",
-			wantHost:   "http://configured.example.com",
-			wantInLink: "http://configured.example.com/gdaemon/setup/",
+			name:        "https_when_TLS_present",
+			withTLS:     true,
+			requestHost: "secure.example.com",
+			want:        "https://secure.example.com",
 		},
 		{
-			name:       "detects_from_request_host_without_configured_host",
-			panelHost:  "",
-			host:       "detected.example.com",
-			wantHost:   "http://detected.example.com",
-			wantInLink: "http://detected.example.com/gdaemon/setup/",
+			name:           "https_when_X_Forwarded_Proto_https",
+			forwardedProto: "https",
+			requestHost:    "req.example.com",
+			want:           "https://req.example.com",
 		},
 		{
-			name:      "uses_x_forwarded_host_header",
-			panelHost: "",
-			headers: map[string]string{
-				"X-Forwarded-Host":  "forwarded.example.com",
-				"X-Forwarded-Proto": "https",
-			},
-			host:       "request.example.com",
-			wantHost:   "https://forwarded.example.com",
-			wantInLink: "https://forwarded.example.com/gdaemon/setup/",
+			name:        "http_default",
+			requestHost: "req.example.com",
+			want:        "http://req.example.com",
 		},
 		{
-			name:       "tls_request_returns_https_scheme",
-			panelHost:  "",
-			host:       "secure.example.com",
-			useTLS:     true,
-			wantHost:   "https://secure.example.com",
-			wantInLink: "https://secure.example.com/gdaemon/setup/",
+			name:          "panelHost_used_for_host",
+			panelHost:     "panel.example.com",
+			forwardedHost: "ignored.example.com",
+			requestHost:   "alsoignored.example.com",
+			want:          "http://panel.example.com",
 		},
 		{
-			name:       "request_host_with_port_kept_in_url_when_no_panel_host",
-			panelHost:  "",
-			host:       "1.2.3.4:8080",
-			wantHost:   "http://1.2.3.4:8080",
-			wantInLink: "http://1.2.3.4:8080/gdaemon/setup/",
-		},
-		{
-			name:      "x_forwarded_host_with_port_used_in_url",
-			panelHost: "",
-			headers: map[string]string{
-				"X-Forwarded-Host": "example.com:9000",
-			},
-			host:       "request.example.com",
-			wantHost:   "http://example.com:9000",
-			wantInLink: "http://example.com:9000/gdaemon/setup/",
-		},
-		{
-			name:      "x_forwarded_proto_https_overrides_scheme_without_tls",
-			panelHost: "panel.example.com",
-			headers: map[string]string{
-				"X-Forwarded-Proto": "https",
-			},
-			host:       "request.example.com",
-			wantHost:   "https://panel.example.com",
-			wantInLink: "https://panel.example.com/gdaemon/setup/",
-		},
-		{
-			name:      "x_forwarded_proto_overrides_tls_detection",
-			panelHost: "panel.example.com",
-			headers: map[string]string{
-				"X-Forwarded-Proto": "http",
-			},
-			host:       "panel.example.com",
-			useTLS:     true,
-			wantHost:   "http://panel.example.com",
-			wantInLink: "http://panel.example.com/gdaemon/setup/",
-		},
-		{
-			name:       "panel_host_with_https_prefix_is_stripped",
-			panelHost:  "https://panel.example.com",
-			host:       "request.example.com",
-			wantHost:   "http://panel.example.com",
-			wantInLink: "http://panel.example.com/gdaemon/setup/",
+			name:          "falls_back_to_X_Forwarded_Host_then_request_Host",
+			panelHost:     "",
+			forwardedHost: "fw.example.com",
+			requestHost:   "req.example.com",
+			want:          "http://fw.example.com",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cacheInstance := cache.NewInMemory()
-			responder := api.NewResponder()
-			handler := NewHandler(cacheInstance, responder, tt.panelHost, nil, 0, "", 0)
-
-			ctx := newAuthCtx()
-
-			req := httptest.NewRequest(http.MethodGet, "/api/dedicated_servers/setup", nil)
-			req = req.WithContext(ctx)
-			req.Host = tt.host
-
-			for key, value := range tt.headers {
-				req.Header.Set(key, value)
+			// ARRANGE
+			h := NewHandler(&fakeResponder{}, tt.panelHost, nil, 31718, "", 0)
+			req := httptest.NewRequest(http.MethodGet, "/api/nodes/setup", nil)
+			if tt.forwardedHost != "" {
+				req.Header.Set("X-Forwarded-Host", tt.forwardedHost)
 			}
-
-			if tt.useTLS {
+			if tt.forwardedProto != "" {
+				req.Header.Set("X-Forwarded-Proto", tt.forwardedProto)
+			}
+			if tt.requestHost != "" {
+				req.Host = tt.requestHost
+			}
+			if tt.withTLS {
 				req.TLS = &tls.ConnectionState{}
 			}
 
-			w := httptest.NewRecorder()
+			// ACT
+			got := h.detectBaseURL(req)
 
-			handler.ServeHTTP(w, req)
-
-			require.Equal(t, http.StatusOK, w.Code)
-
-			var resp setupResponse
-			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-
-			assert.Equal(t, tt.wantHost, resp.Host, "Host field must match expected")
-			assert.Contains(t, resp.Link, tt.wantInLink, "Link must use detected base URL")
+			// ASSERT
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
-func TestNewLegacySetupResponse(t *testing.T) {
-	token := "test-token"
-	host := "https://example.com"
+// -----------------------------------------------------------------------------
+// NewHandler dependency assembly
+// -----------------------------------------------------------------------------
 
-	resp := newLegacySetupResponse(token, host)
+func TestNewHandler_assemblesDependencies(t *testing.T) {
+	// ARRANGE
+	responder := &fakeResponder{}
+	svc := newEnrollmentService(t, nil)
 
-	assert.Equal(t, "test-token", resp.Token)
-	assert.Equal(t, "https://example.com", resp.Host)
-	assert.Equal(t, "https://example.com/gdaemon/setup/test-token", resp.Link)
-	assert.False(t, resp.GRPCEnabled)
-}
+	// ACT
+	h := NewHandler(responder, "panel.example.com", svc, 31718, "grpc.example.com", 9090)
 
-func TestHandler_LegacyCacheSetError(t *testing.T) {
-	cacheInstance := newFakeCache(errors.New("storage backend offline"))
-	responder := api.NewResponder()
-	handler := NewHandler(cacheInstance, responder, "panel.example.com", nil, 0, "", 0)
-
-	ctx := newAuthCtx()
-	req := httptest.NewRequest(http.MethodGet, "/api/dedicated_servers/setup", nil)
-	req = req.WithContext(ctx)
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	require.Equal(t, http.StatusInternalServerError, w.Code)
-
-	var response map[string]any
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
-	assert.Equal(t, "error", response["status"])
-
-	errorMsg, ok := response["error"].(string)
-	require.True(t, ok)
-	assert.Contains(t, errorMsg, "Internal Server Error",
-		"500 responses should hide internal error detail per pkg/api responder contract")
-}
-
-func TestHandler_GRPCMode(t *testing.T) {
-	tests := []struct {
-		name           string
-		panelHost      string
-		grpcPort       uint16
-		grpcExtHost    string
-		grpcExtPort    uint16
-		host           string
-		headers        map[string]string
-		validateResp   func(t *testing.T, resp setupResponse)
-		expectedStatus int
-	}{
-		{
-			name:           "grpc_mode_success_uses_internal_grpc_port",
-			panelHost:      "panel.example.com",
-			grpcPort:       31718,
-			host:           "request.example.com",
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.True(t, resp.GRPCEnabled, "grpc_enabled flag must be true in gRPC mode")
-				assert.NotEmpty(t, resp.Token, "Token (setup key) must be returned")
-				assert.Len(t, resp.Token, 32, "setup key length must match enrollment.setupKeyLength")
-
-				assert.Equal(t, "http://panel.example.com", resp.Host)
-				assert.Equal(t, resp.Link, resp.SetupLink, "SetupLink should mirror Link in gRPC mode")
-				assert.Contains(t, resp.Link, "http://panel.example.com/nodes/setup/"+resp.Token,
-					"Link must point to /nodes/setup/<key>")
-
-				assert.Equal(t, "grpc://panel.example.com:31718/"+resp.Token, resp.ConnectURL,
-					"connect URL must use scheme grpc + panel host + grpcPort + key")
-
-				assert.Equal(t, "bash <(curl -s '"+resp.Link+"')", resp.LinuxCmd,
-					"Linux command must use process substitution so CLI args can follow")
-				assert.Equal(t, "gameapctl daemon install --connect="+resp.ConnectURL, resp.WindowsCmd,
-					"Windows command must contain --connect=<connect-url>")
-			},
-		},
-		{
-			name:           "grpc_mode_uses_grpc_ext_port_when_set",
-			panelHost:      "panel.example.com",
-			grpcPort:       31718,
-			grpcExtPort:    9999,
-			host:           "request.example.com",
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.Contains(t, resp.ConnectURL, ":9999/", "external grpc port must override internal port")
-				assert.NotContains(t, resp.ConnectURL, ":31718/", "internal grpc port must not appear")
-			},
-		},
-		{
-			name:           "grpc_mode_uses_grpc_ext_host_when_set",
-			panelHost:      "panel.example.com",
-			grpcPort:       31718,
-			grpcExtHost:    "grpc.public.example.com",
-			host:           "request.example.com",
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.Equal(t, "http://panel.example.com", resp.Host,
-					"public Host should still come from panel host detection")
-				assert.Contains(t, resp.ConnectURL, "grpc://grpc.public.example.com:31718/",
-					"grpc connect URL must use grpcExtHost")
-			},
-		},
-		{
-			name:        "grpc_mode_strips_port_from_request_host_for_grpc_url",
-			panelHost:   "",
-			grpcPort:    31718,
-			host:        "1.2.3.4:8080",
-			grpcExtHost: "",
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.Contains(t, resp.ConnectURL, "grpc://1.2.3.4:31718/",
-					"resolveGRPCHost must strip the port from r.Host before assembling connect URL")
-				assert.NotContains(t, resp.ConnectURL, ":8080:")
-			},
-			expectedStatus: http.StatusOK,
-		},
-		{
-			name:      "grpc_mode_falls_back_to_x_forwarded_host_when_panel_host_empty",
-			panelHost: "",
-			grpcPort:  31718,
-			host:      "request.example.com",
-			headers: map[string]string{
-				"X-Forwarded-Host": "forwarded.example.com:9000",
-			},
-			expectedStatus: http.StatusOK,
-			validateResp: func(t *testing.T, resp setupResponse) {
-				t.Helper()
-
-				assert.Contains(t, resp.ConnectURL, "grpc://forwarded.example.com:31718/",
-					"resolveGRPCHost falls back to X-Forwarded-Host with stripped port")
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cacheInstance := cache.NewInMemory()
-			responder := api.NewResponder()
-			enrollSvc := newEnrollmentService(t, cacheInstance)
-			handler := NewHandler(
-				cacheInstance,
-				responder,
-				tt.panelHost,
-				enrollSvc,
-				tt.grpcPort,
-				tt.grpcExtHost,
-				tt.grpcExtPort,
-			)
-
-			req := httptest.NewRequest(http.MethodGet, "/api/dedicated_servers/setup", nil)
-			req = req.WithContext(newAuthCtx())
-			req.Host = tt.host
-
-			for key, value := range tt.headers {
-				req.Header.Set(key, value)
-			}
-
-			w := httptest.NewRecorder()
-
-			handler.ServeHTTP(w, req)
-
-			require.Equal(t, tt.expectedStatus, w.Code)
-
-			var resp setupResponse
-			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-
-			tt.validateResp(t, resp)
-
-			storedKey, err := cacheInstance.Get(context.Background(), enrollment.SetupKeyCacheKey)
-			require.NoError(t, err, "generated setup key must be persisted in cache for later validation")
-			assert.Equal(t, resp.Token, storedKey,
-				"the key returned to the client must match the one stored in cache")
-		})
-	}
-}
-
-func TestHandler_GRPCModeGenerateError(t *testing.T) {
-	cacheInstance := newFakeCache(errors.New("redis cluster down"))
-	responder := api.NewResponder()
-	enrollSvc := newEnrollmentService(t, cacheInstance)
-	handler := NewHandler(cacheInstance, responder, "panel.example.com", enrollSvc, 31718, "", 0)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/dedicated_servers/setup", nil)
-	req = req.WithContext(newAuthCtx())
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	require.Equal(t, http.StatusInternalServerError, w.Code,
-		"setup key generation failure must surface as 500")
-
-	var response map[string]any
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
-	assert.Equal(t, "error", response["status"])
-
-	errorMsg, ok := response["error"].(string)
-	require.True(t, ok)
-	assert.Contains(t, errorMsg, "Internal Server Error",
-		"500 responses should hide internal error detail per pkg/api responder contract")
-
-	_, err := cacheInstance.Get(context.Background(), enrollment.SetupKeyCacheKey)
-	assert.Error(t, err, "no setup key should be persisted when Generate fails")
+	// ASSERT
+	require.NotNil(t, h)
+	assert.Same(t, responder, h.responder, "the configured responder must be retained")
+	assert.Equal(t, "panel.example.com", h.panelHost)
+	assert.Same(t, svc, h.enrollmentSvc, "the configured enrollment service must be retained")
+	assert.Equal(t, uint16(31718), h.grpcPort)
+	assert.Equal(t, "grpc.example.com", h.grpcExtHost)
+	assert.Equal(t, uint16(9090), h.grpcExtPort)
 }

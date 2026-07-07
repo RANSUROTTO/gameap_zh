@@ -8,9 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	trmsql "github.com/avito-tech/go-transaction-manager/drivers/sql/v2"
@@ -21,7 +21,10 @@ import (
 	acmelocker "github.com/gameap/gameap/internal/acme/locker"
 	acmestorage "github.com/gameap/gameap/internal/acme/storage"
 	internalapi "github.com/gameap/gameap/internal/api"
+	"github.com/gameap/gameap/internal/api/filemanager/filemanagermime"
 	"github.com/gameap/gameap/internal/api/middlewares"
+	"github.com/gameap/gameap/internal/application/defaults"
+	"github.com/gameap/gameap/internal/audit"
 	"github.com/gameap/gameap/internal/cache"
 	"github.com/gameap/gameap/internal/certificates"
 	"github.com/gameap/gameap/internal/config"
@@ -52,13 +55,16 @@ import (
 	"github.com/gameap/gameap/internal/repositories/postgres"
 	"github.com/gameap/gameap/internal/repositories/sqlite"
 	"github.com/gameap/gameap/internal/services"
+	"github.com/gameap/gameap/internal/services/captcha"
 	"github.com/gameap/gameap/internal/services/filemanager/archiver"
 	"github.com/gameap/gameap/internal/services/gameapimporter"
 	"github.com/gameap/gameap/internal/services/gameexporter"
+	"github.com/gameap/gameap/internal/services/mfanudge"
 	"github.com/gameap/gameap/internal/services/pelicaneggimporter"
 	"github.com/gameap/gameap/internal/services/pluginstore"
 	"github.com/gameap/gameap/internal/services/serverconfigpush"
 	"github.com/gameap/gameap/internal/services/servercontrol"
+	"github.com/gameap/gameap/internal/services/servertaskdispatcher"
 	"github.com/gameap/gameap/internal/services/taskdispatcher"
 	"github.com/gameap/gameap/internal/services/taskreaper"
 	"github.com/gameap/gameap/internal/transfers"
@@ -68,6 +74,9 @@ import (
 	"github.com/gameap/gameap/pkg/auth"
 	pkgplugin "github.com/gameap/gameap/pkg/plugin"
 	"github.com/gameap/gameap/pkg/secret"
+	"github.com/gameap/gameap/pkg/tlsutil"
+	"github.com/gameap/gameap/pkg/twofactor"
+	webstatic "github.com/gameap/gameap/web/static"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
@@ -128,7 +137,7 @@ type Container struct {
 	personalAccessTokenRepository repositories.PersonalAccessTokenRepository
 	daemonTasksRepository         repositories.DaemonTaskRepository
 	serverTaskRepository          repositories.ServerTaskRepository
-	serverTaskFailRepository      repositories.ServerTaskFailRepository
+	serverTaskExecutionRepository repositories.ServerTaskExecutionRepository
 	serverSettingRepository       repositories.ServerSettingRepository
 	nodeRepository                repositories.NodeRepository
 	clientCertificateRepository   repositories.ClientCertificateRepository
@@ -137,16 +146,20 @@ type Container struct {
 
 	// Services
 	authService          auth.Service
+	twoFactorManager     *twofactor.Manager
 	userService          *services.UserService
 	serverControlService *servercontrol.Service
 	taskDispatcher       *taskdispatcher.Dispatcher
+	serverTaskDispatcher *servertaskdispatcher.Dispatcher
 	serverConfigPusher   *serverconfigpush.Pusher
 	globalAPIService     *services.GlobalAPIService
 	pluginStoreService   *pluginstore.Service
+	captchaVerifier      *captcha.Service
 	gameUpgrader         *services.GameUpgradeService
 	pelicanEggImporter   *pelicaneggimporter.Importer
 	gameAPImporter       *gameapimporter.Importer
 	gameExporter         *gameexporter.Exporter
+	mfaNudgeService      *mfanudge.Service
 	rbac                 *rbac.RBAC
 	cache                cache.Cache
 	fileManager          files.FileManager
@@ -157,18 +170,18 @@ type Container struct {
 
 	secretCipher *secret.Cipher
 
+	passwordBlocklist     auth.Blocklist
+	passwordBlocklistOnce sync.Once
+
 	// Daemon Services
 	daemonStatus         *daemon.StatusService
-	daemonStatusLegacy   *daemon.StatusBINNService
 	daemonFiles          *daemon.FileService
-	daemonFilesLeg       *daemon.FileBINNService
 	fileDispatcher       daemon.FileDispatcher
 	commandDispatcher    daemon.CommandDispatcher
 	statusDispatcher     daemon.StatusDispatcher
 	consoleLogDispatcher daemon.ConsoleLogDispatcher
 	httpProxyDispatcher  daemon.HTTPProxyDispatcher
 	daemonCommands       *daemon.CommandService
-	daemonCommandsLeg    *daemon.CommandBINNService
 	daemonConsoleLog     *daemon.ConsoleLogService
 	daemonHTTPProxy      *daemon.HTTPProxyService
 
@@ -186,10 +199,13 @@ type Container struct {
 	pluginLoader     *internalplugin.Loader
 
 	// HTTP
-	router      *http.ServeMux
-	httpServer  *http.Server
-	httpsServer *http.Server
-	responder   *api.Responder
+	router                    *http.ServeMux
+	httpServer                *http.Server
+	httpsServer               *http.Server
+	responder                 *api.Responder
+	auditLogger               audit.Logger
+	securityHeadersMiddleware *middlewares.SecurityHeadersMiddleware
+	fileUploadMIMEChecker     *filemanagermime.Checker
 
 	// ACME
 	acmeService *acme.Service
@@ -353,6 +369,49 @@ func (c *Container) SecretCipher() *secret.Cipher {
 	c.secretCipher = cipher
 
 	return c.secretCipher
+}
+
+// PasswordBlocklist returns the process-wide common-password blocklist
+// consulted by auth.ValidatePassword to satisfy OWASP ASVS 4.0.3 §2.1.7.
+//
+// When AUTH_ALLOW_WEAK_PASSWORDS=true the loader is skipped entirely (no
+// memory cost) and a startup slog.Warn is emitted. On a load failure the
+// accessor falls back to auth.NoopBlocklist with a prominent slog.Error so
+// a corrupt embedded asset does not block bootstrap of the admin user.
+func (c *Container) PasswordBlocklist() auth.Blocklist {
+	c.passwordBlocklistOnce.Do(func() {
+		if c.config.Auth.AllowWeakPasswords {
+			slog.Warn("AUTH_ALLOW_WEAK_PASSWORDS is enabled: common-password " +
+				"blocklist is DISABLED; users may set weak passwords " +
+				"(ASVS 2.1.7 not enforced)")
+
+			c.passwordBlocklist = auth.NoopBlocklist{}
+
+			return
+		}
+
+		bl, err := auth.LoadEmbeddedBlocklist()
+		if err != nil {
+			slog.Error(
+				"password blocklist failed to load — common-password protection DISABLED for this process",
+				slog.String("error", err.Error()),
+			)
+
+			c.passwordBlocklist = auth.NoopBlocklist{}
+
+			return
+		}
+
+		slog.Info(
+			"Password blocklist loaded",
+			slog.Int("entries", bl.Len()),
+			slog.String("source", "embedded"),
+		)
+
+		c.passwordBlocklist = bl
+	})
+
+	return c.passwordBlocklist
 }
 
 func (c *Container) DB() *sql.DB {
@@ -527,6 +586,14 @@ func (c *Container) createHTTPServer() *http.Server {
 		handler = middlewares.HTTPSRedirectMiddleware(c.config.HTTPSPort)(handler)
 	}
 
+	// Wrapped outside HTTPSRedirect so the 301 carries HSTS too. Stays inside
+	// audit because audit must remain the outermost middleware.
+	handler = c.SecurityHeadersMiddleware().Middleware(handler)
+
+	// Outermost: assign/propagate the correlation ID and capture per-request
+	// metadata so every audit event of the request is joinable.
+	handler = audit.NewRequestContextMiddleware(c.config.Audit.ClientIPHeader).Middleware(handler)
+
 	return &http.Server{
 		Addr:         net.JoinHostPort(c.config.HTTPBindIP, strconv.Itoa(int(c.config.HTTPPort))),
 		Handler:      handler,
@@ -545,7 +612,10 @@ func (c *Container) HTTPSServer() *http.Server {
 }
 
 func (c *Container) createHTTPSServer() *http.Server {
-	handler := c.Router()
+	var handler http.Handler = c.Router()
+
+	handler = c.SecurityHeadersMiddleware().Middleware(handler)
+	handler = audit.NewRequestContextMiddleware(c.config.Audit.ClientIPHeader).Middleware(handler)
 
 	return &http.Server{
 		Addr:         net.JoinHostPort(c.config.HTTPBindIP, strconv.Itoa(int(c.config.HTTPSPort))),
@@ -554,6 +624,26 @@ func (c *Container) createHTTPSServer() *http.Server {
 		ReadTimeout:  httpServerReadTimeout,
 		IdleTimeout:  httpServerIdleTimeout,
 	}
+}
+
+func (c *Container) SecurityHeadersMiddleware() *middlewares.SecurityHeadersMiddleware {
+	if c.securityHeadersMiddleware != nil {
+		return c.securityHeadersMiddleware
+	}
+
+	static, err := webstatic.GetFS()
+	if err != nil {
+		panic("security headers: failed to get static files: " + err.Error())
+	}
+
+	m, err := middlewares.NewSecurityHeadersMiddleware(c.config, static)
+	if err != nil {
+		panic("security headers: " + err.Error())
+	}
+
+	c.securityHeadersMiddleware = m
+
+	return c.securityHeadersMiddleware
 }
 
 func (c *Container) ACMEService() *acme.Service {
@@ -614,6 +704,36 @@ func (c *Container) createResponder() *api.Responder {
 	return api.NewResponder()
 }
 
+// FileUploadMIMEChecker returns the configured MIME allowlist checker used
+// by the file-upload handler. Built once at first access; the configuration
+// is sourced from Files.Upload.{AllowedMIMEs,AllowArchives,AllowBinary}.
+func (c *Container) FileUploadMIMEChecker() *filemanagermime.Checker {
+	if c.fileUploadMIMEChecker == nil {
+		c.fileUploadMIMEChecker = filemanagermime.NewChecker(filemanagermime.Config{
+			AllowedMIMEs:  c.config.Files.Upload.AllowedMIMEs,
+			AllowArchives: c.config.Files.Upload.AllowArchives,
+			AllowBinary:   c.config.Files.Upload.AllowBinary,
+		})
+	}
+
+	return c.fileUploadMIMEChecker
+}
+
+// AuditLogger returns the structured security audit logger. When audit
+// logging is disabled in config it returns a no-op logger so call sites
+// never need to guard.
+func (c *Container) AuditLogger() audit.Logger {
+	if c.auditLogger == nil {
+		if c.config.Audit.Enabled {
+			c.auditLogger = audit.NewLogger(slog.Default())
+		} else {
+			c.auditLogger = audit.NopLogger{}
+		}
+	}
+
+	return c.auditLogger
+}
+
 func (c *Container) UserRepository() repositories.UserRepository {
 	if c.userRepository == nil {
 		c.userRepository = c.createUserRepository()
@@ -668,9 +788,7 @@ func (c *Container) createServerControlService() *servercontrol.Service {
 		))
 	}
 
-	if c.config.GRPC.Enabled {
-		opts = append(opts, servercontrol.WithTaskDispatcher(c.TaskDispatcher()))
-	}
+	opts = append(opts, servercontrol.WithTaskDispatcher(c.TaskDispatcher()))
 
 	return servercontrol.NewService(
 		c.DaemonTaskRepository(),
@@ -696,6 +814,20 @@ func (c *Container) TaskDispatcher() *taskdispatcher.Dispatcher {
 	}
 
 	return c.taskDispatcher
+}
+
+func (c *Container) ServerTaskDispatcher() *servertaskdispatcher.Dispatcher {
+	if c.serverTaskDispatcher == nil {
+		c.serverTaskDispatcher = servertaskdispatcher.NewDispatcher(
+			c.SessionRegistry(),
+			c.ServerTaskRepository(),
+			c.ServerTaskExecutionRepository(),
+			c.PubSub(),
+			slog.Default(),
+		)
+	}
+
+	return c.serverTaskDispatcher
 }
 
 func (c *Container) ServerConfigPusher() *serverconfigpush.Pusher {
@@ -744,6 +876,35 @@ func (c *Container) createAuthService() auth.Service {
 	}
 }
 
+// TwoFactorManager provides TOTP, secret-encryption and recovery-code
+// primitives. The at-rest encryption key is HKDF-derived from EncryptionKey
+// when set, otherwise from the (always-present) AuthSecret, so existing
+// installs need no new configuration.
+func (c *Container) TwoFactorManager() *twofactor.Manager {
+	if c.twoFactorManager == nil {
+		c.twoFactorManager = c.createTwoFactorManager()
+	}
+
+	return c.twoFactorManager
+}
+
+func (c *Container) createTwoFactorManager() *twofactor.Manager {
+	appKey := c.config.EncryptionKey
+	if appKey == "" {
+		appKey = c.config.AuthSecret
+	}
+	if appKey == "" {
+		panic("neither ENCRYPTION_KEY nor AUTH_SECRET is set; cannot initialise two-factor manager")
+	}
+
+	manager, err := twofactor.NewManager([]byte(appKey))
+	if err != nil {
+		panic(errors.WithMessage(err, "failed to create two-factor manager"))
+	}
+
+	return manager
+}
+
 func (c *Container) UserService() *services.UserService {
 	if c.userService == nil {
 		c.userService = c.createUserService()
@@ -754,6 +915,14 @@ func (c *Container) UserService() *services.UserService {
 
 func (c *Container) createUserService() *services.UserService {
 	return services.NewUserService(c.UserRepository())
+}
+
+func (c *Container) MFANudgeService() *mfanudge.Service {
+	if c.mfaNudgeService == nil {
+		c.mfaNudgeService = mfanudge.New(*c.config, nil)
+	}
+
+	return c.mfaNudgeService
 }
 
 func (c *Container) RBACRepository() repositories.RBACRepository {
@@ -880,27 +1049,26 @@ func (c *Container) createServerTaskRepository() repositories.ServerTaskReposito
 	}
 }
 
-func (c *Container) ServerTaskFailRepository() repositories.ServerTaskFailRepository {
-	if c.serverTaskFailRepository == nil {
-		c.serverTaskFailRepository = c.createServerTaskFailRepository()
+func (c *Container) ServerTaskExecutionRepository() repositories.ServerTaskExecutionRepository {
+	if c.serverTaskExecutionRepository == nil {
+		c.serverTaskExecutionRepository = c.createServerTaskExecutionRepository()
 	}
 
-	return c.serverTaskFailRepository
+	return c.serverTaskExecutionRepository
 }
 
-func (c *Container) createServerTaskFailRepository() repositories.ServerTaskFailRepository {
+func (c *Container) createServerTaskExecutionRepository() repositories.ServerTaskExecutionRepository {
 	switch c.config.DatabaseDriver {
 	case databaseDriverMySQL:
-		return mysql.NewServerTaskFailRepository(c.TransactionalDB())
+		return mysql.NewServerTaskExecutionRepository(c.TransactionalDB())
 	case databaseDriverPostgres, databaseDriverPGX:
-		return postgres.NewServerTaskFailRepository(c.TransactionalDB())
+		return postgres.NewServerTaskExecutionRepository(c.TransactionalDB())
 	case databaseDriverSQLite:
-		return sqlite.NewServerTaskFailRepository(c.TransactionalDB())
+		return sqlite.NewServerTaskExecutionRepository(c.TransactionalDB())
 	case databaseDriverInMemory:
-		return inmemory.NewServerTaskFailRepository()
+		return inmemory.NewServerTaskExecutionRepository()
 	default:
-		// Use in-memory repository as fallback
-		return inmemory.NewServerTaskFailRepository()
+		return inmemory.NewServerTaskExecutionRepository()
 	}
 }
 
@@ -1229,7 +1397,7 @@ func (c *Container) createFileManager() files.FileManager {
 	case filesDriverLocal:
 		basePath := c.config.Files.Local.BasePath
 		if basePath == "" {
-			basePath = path.Join(c.config.Legacy.Path, "storage", "app")
+			basePath = defaults.StoragePath
 		}
 
 		if basePath == "" {
@@ -1304,14 +1472,6 @@ func (c *Container) EnrollmentService() *enrollment.Service {
 	return c.enrollmentService
 }
 
-func (c *Container) EnrollmentServiceOrNil() *enrollment.Service {
-	if !c.config.GRPC.Enabled {
-		return nil
-	}
-
-	return c.EnrollmentService()
-}
-
 func (c *Container) GRPCPort() uint16 {
 	return c.config.GRPC.Port
 }
@@ -1334,6 +1494,29 @@ func (c *Container) GlobalAPIService() *services.GlobalAPIService {
 
 func (c *Container) createGlobalAPIService() *services.GlobalAPIService {
 	return services.NewGlobalAPIService(c.Config())
+}
+
+// CaptchaVerifier returns the login captcha verifier. It is a no-op
+// (Enabled() == false) until CAPTCHA_PROVIDER and CAPTCHA_SECRET_KEY are set.
+func (c *Container) CaptchaVerifier() *captcha.Service {
+	if c.captchaVerifier == nil {
+		c.captchaVerifier = c.createCaptchaVerifier()
+	}
+
+	return c.captchaVerifier
+}
+
+func (c *Container) createCaptchaVerifier() *captcha.Service {
+	cfg := c.Config().Captcha
+
+	return captcha.NewService(captcha.Config{
+		Provider:  captcha.Provider(cfg.Provider),
+		SiteKey:   cfg.SiteKey,
+		SecretKey: cfg.SecretKey,
+		MinScore:  cfg.MinScore,
+		FailOpen:  cfg.FailOpen,
+		VerifyURL: cfg.VerifyURL,
+	})
 }
 
 func (c *Container) PluginStoreService() *pluginstore.Service {
@@ -1407,24 +1590,11 @@ func (c *Container) DaemonStatus() *daemon.StatusService {
 			c.GatewayService(),
 			c.SessionRegistry(),
 			c.StatusDispatcher(),
-			c.DaemonStatusLegacy(),
 			slog.Default(),
 		)
 	}
 
 	return c.daemonStatus
-}
-
-func (c *Container) DaemonStatusLegacy() *daemon.StatusBINNService {
-	if c.daemonStatusLegacy == nil {
-		c.daemonStatusLegacy = daemon.NewStatusBINNService(
-			c.ClientCertificateRepository(),
-			c.FileManager(),
-			daemon.WithSecretCipher(c.SecretCipher()),
-		)
-	}
-
-	return c.daemonStatusLegacy
 }
 
 func (c *Container) DaemonFiles() *daemon.FileService {
@@ -1435,7 +1605,6 @@ func (c *Container) DaemonFiles() *daemon.FileService {
 			c.FileDispatcher(),
 			c.StreamFileManager(),
 			c.TransferRegistry(),
-			c.DaemonFilesLegacy(),
 			slog.Default(),
 		)
 	}
@@ -1497,18 +1666,6 @@ func (c *Container) FileManagerArchiveGuard() *archiver.InMemoryConcurrencyGuard
 	return c.fileManagerArchiveGuard
 }
 
-func (c *Container) DaemonFilesLegacy() *daemon.FileBINNService {
-	if c.daemonFilesLeg == nil {
-		c.daemonFilesLeg = daemon.NewFileBINNService(
-			c.ClientCertificateRepository(),
-			c.FileManager(),
-			daemon.WithSecretCipher(c.SecretCipher()),
-		)
-	}
-
-	return c.daemonFilesLeg
-}
-
 func (c *Container) FileDispatcher() daemon.FileDispatcher {
 	if c.fileDispatcher == nil {
 		instanceID := c.config.PubSub.InstanceID
@@ -1535,24 +1692,11 @@ func (c *Container) DaemonCommands() *daemon.CommandService {
 			c.GatewayService(),
 			c.SessionRegistry(),
 			c.CommandDispatcher(),
-			c.DaemonCommandsLegacy(),
 			slog.Default(),
 		)
 	}
 
 	return c.daemonCommands
-}
-
-func (c *Container) DaemonCommandsLegacy() *daemon.CommandBINNService {
-	if c.daemonCommandsLeg == nil {
-		c.daemonCommandsLeg = daemon.NewCommandBINNService(
-			c.ClientCertificateRepository(),
-			c.FileManager(),
-			daemon.WithSecretCipher(c.SecretCipher()),
-		)
-	}
-
-	return c.daemonCommandsLeg
 }
 
 func (c *Container) CommandDispatcher() daemon.CommandDispatcher {
@@ -1685,7 +1829,14 @@ func (c *Container) createPluginManager() *pkgplugin.Manager {
 				&lazyServerController{container: c},
 			),
 			hostlibrary.NewCacheHostLibrary(c.Cache(), "plugin:"),
-			hostlibrary.NewHTTPHostLibrary(),
+			hostlibrary.NewHTTPHostLibrary(hostlibrary.HTTPConfig{
+				BlockPrivateIPs:         c.config.Plugin.HTTP.BlockPrivateIPs,
+				AllowedSchemes:          c.config.Plugin.HTTP.AllowedSchemes,
+				AllowedHosts:            c.config.Plugin.HTTP.AllowedHosts,
+				MaxTimeoutSeconds:       c.config.Plugin.HTTP.MaxTimeoutSeconds,
+				MaxRedirects:            c.config.Plugin.HTTP.MaxRedirects,
+				ResponseHeaderAllowlist: c.config.Plugin.HTTP.ResponseHeaderAllowlist,
+			}),
 			hostlibrary.NewLogHostLibrary(slog.Default()),
 			hostlibrary.NewNodeFSHostLibrary(c.DaemonFiles(), c.NodeRepository()),
 			hostlibrary.NewNodeCmdHostLibrary(c.DaemonCommands(), c.NodeRepository()),
@@ -1863,6 +2014,12 @@ func (c *Container) MetricsHub() metrics.Hub {
 			slog.Default(),
 			metrics.Options{},
 		)
+
+		c.appendShutdownFunc(func() error {
+			c.metricsHub.Stop()
+
+			return nil
+		})
 	}
 
 	return c.metricsHub
@@ -1902,6 +2059,7 @@ func (c *Container) GatewayService() *gateway.Service {
 			c.ServerStatusHandler(),
 			c.AttachHandler(),
 			c.MetricsHandler(),
+			c.ServerTaskDispatcher(),
 			c.EnrollmentService(),
 			slog.Default(),
 		)
@@ -1933,10 +2091,6 @@ func (c *Container) TransferRegistry() *transfers.Registry {
 }
 
 func (c *Container) grpcTLSConfig() (*tls.Config, error) {
-	if !c.config.GRPC.Enabled {
-		return nil, nil
-	}
-
 	if !c.config.GRPC.TLSEnabled {
 		slog.Warn("gRPC server is running without TLS. It is recommended to enable TLS for security")
 
@@ -2019,9 +2173,8 @@ func (c *Container) buildGRPCTLSConfig() (*tls.Config, error) {
 		)
 	}
 
-	tlsCfg := &tls.Config{
+	tlsCfg := tlsutil.HardenServerConfig(&tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			remoteAddr := "unknown"
 			if chi.Conn != nil && chi.Conn.RemoteAddr() != nil {
@@ -2058,7 +2211,7 @@ func (c *Container) buildGRPCTLSConfig() (*tls.Config, error) {
 
 			return nil
 		},
-	}
+	})
 
 	if c.config.GRPC.RequireMTLS {
 		rootCAPEM, err := certSvc.Root(ctx)
@@ -2138,10 +2291,9 @@ func (c *Container) buildMultiplexerTLSConfig() (*tls.Config, error) {
 		return nil, errors.Wrap(err, "load TLS certificate")
 	}
 
-	return &tls.Config{
+	return tlsutil.HardenServerConfig(&tls.Config{
 		Certificates: []tls.Certificate{*cert},
-		MinVersion:   tls.VersionTLS12,
-	}, nil
+	}), nil
 }
 
 func (c *Container) getMultiplexerAddress() string {

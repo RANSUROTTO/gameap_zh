@@ -1,16 +1,21 @@
 package upload
 
 import (
+	"bufio"
 	"context"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/gameap/gameap/internal/api/base"
+	"github.com/gameap/gameap/internal/api/filemanager/filemanagermime"
 	"github.com/gameap/gameap/internal/api/filemanager/filemanagerpath"
 	serversbase "github.com/gameap/gameap/internal/api/servers/base"
+	"github.com/gameap/gameap/internal/audit"
 	"github.com/gameap/gameap/internal/daemon"
 	"github.com/gameap/gameap/internal/domain"
 	"github.com/gameap/gameap/internal/filters"
@@ -24,12 +29,18 @@ const (
 	maxMemory     = 32 << 20 // 32 MB
 	defaultPerms  = 0o644
 	maxUploadSize = 100 << 20 // 100 MB
+
+	// mimeSniffWindow is the number of bytes inspected by
+	// http.DetectContentType. The HTTP spec mandates 512; reading more
+	// neither helps the detector nor matches browser sniffing rules.
+	mimeSniffWindow = 512
 )
 
 var (
 	errUserNotAuthenticated = errors.New("user not authenticated")
 	errNoFilesUploaded      = errors.New("no files uploaded")
 	errInvalidFileSize      = errors.New("invalid file size")
+	errUnsupportedMediaType = errors.New("file content type is not on the upload allowlist")
 )
 
 type fileService interface {
@@ -49,7 +60,9 @@ type Handler struct {
 	abilityChecker *serversbase.AbilityChecker
 	nodeRepo       repositories.NodeRepository
 	daemonFiles    fileService
+	mimeChecker    *filemanagermime.Checker
 	responder      base.Responder
+	audit          audit.Logger
 }
 
 func NewHandler(
@@ -57,14 +70,29 @@ func NewHandler(
 	nodeRepo repositories.NodeRepository,
 	rbac base.RBAC,
 	daemonFiles fileService,
+	mimeChecker *filemanagermime.Checker,
 	responder base.Responder,
+	auditLogger audit.Logger,
 ) *Handler {
+	if auditLogger == nil {
+		auditLogger = audit.NopLogger{}
+	}
+
+	// Defence-in-depth: a caller that passes nil for the MIME checker
+	// receives the default (deny-by-default) configuration so an
+	// integration regression cannot accidentally ship an open upload.
+	if mimeChecker == nil {
+		mimeChecker = filemanagermime.NewChecker(filemanagermime.Config{})
+	}
+
 	return &Handler{
 		serverFinder:   serversbase.NewServerFinder(serverRepo, rbac),
 		abilityChecker: serversbase.NewAbilityChecker(rbac),
 		nodeRepo:       nodeRepo,
 		daemonFiles:    daemonFiles,
+		mimeChecker:    mimeChecker,
 		responder:      responder,
+		audit:          auditLogger,
 	}
 }
 
@@ -174,6 +202,10 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	audit.SensitiveOp(ctx, h.audit, audit.EventFileUpload, audit.CategoryFileOp,
+		"server", strconv.FormatUint(uint64(serverID), 10), "upload",
+		slog.Int("files", len(files)))
+
 	h.responder.Write(ctx, rw, newUploadResponse())
 }
 
@@ -229,11 +261,46 @@ func (h *Handler) processFiles(
 		}
 		fileSize := uint64(fileHeader.Size)
 
+		// Sniff the first 512 bytes to determine the real MIME (the
+		// client-declared Content-Type and the extension are NOT
+		// trusted — a malicious upload of <html>… renamed to "logo.png"
+		// would otherwise sail through). We then prepend the sniffed
+		// bytes back onto the read stream so UploadStream sees the
+		// full file. Done before any network IO so a reject is cheap.
+		buffered := bufio.NewReaderSize(file, mimeSniffWindow)
+		sniff, sniffErr := buffered.Peek(mimeSniffWindow)
+		if sniffErr != nil && !errors.Is(sniffErr, io.EOF) {
+			_ = file.Close()
+
+			return errors.WithMessage(sniffErr, "failed to read upload header for MIME detection")
+		}
+
+		detected := http.DetectContentType(sniff)
+		bare, allowed := h.mimeChecker.Allowed(detected)
+		if !allowed {
+			_ = file.Close()
+			audit.SensitiveOp(ctx, h.audit, audit.EventFileUpload, audit.CategoryFileOp,
+				"server", strconv.FormatUint(uint64(server.ID), 10), "upload_rejected",
+				slog.String("filename", fileHeader.Filename),
+				slog.String("detected_mime", bare),
+				slog.String("reason", "mime_not_allowed"))
+
+			return api.WrapHTTPError(
+				errors.Wrapf(errUnsupportedMediaType,
+					"file %s rejected: detected MIME %q is not allowed", fileHeader.Filename, bare),
+				http.StatusUnsupportedMediaType,
+			)
+		}
+
 		err = h.daemonFiles.UploadStream(
 			ctx,
 			node,
 			fullPath,
-			file,
+			// io.MultiReader keeps the sniffed bytes available — they
+			// were Peek'ed, not Read, but the bufio reader can be
+			// drained either way. We use buffered directly so the
+			// remaining Read calls go through the same reader.
+			buffered,
 			fileSize,
 			defaultPerms,
 			owner,

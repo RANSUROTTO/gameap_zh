@@ -18,30 +18,11 @@
         {{ trans('servers.control') }}
       </template>
 
-      <div class="md:flex md:flex-wrap mt-2" v-show="serverQueryOnline">
-        <div class="md:w-full">
-          <n-card
-              class="mb-3"
-          >
-            <Loading v-if="loading"></Loading>
-            <ServerStatus v-if="!loading" ref="serverStatusRef" :server-id="serverId"></ServerStatus>
-          </n-card>
-        </div>
-      </div>
-
-      <div class="md:flex mt-2">
-        <div class="md:w-1/2 md:pr-8">
-          <n-card
-              :title="trans('servers.commands')"
-              class="mb-3"
-              header-class="g-card-header"
-              :segmented="{
-                          content: true,
-                          footer: 'soft'
-                        }"
-          >
-            <Loading v-if="loading"></Loading>
-            <div v-if="!loading" id="serverControl">
+      <div class="mt-2">
+        <n-card size="small" class="mb-3">
+          <Loading v-if="loading"></Loading>
+          <div v-else class="flex flex-wrap items-center gap-y-2">
+            <div id="serverControl" class="flex flex-wrap items-center">
               <ServerControlButton
                   command="start"
                   v-if="serverStore.canStart && !serverOnline"
@@ -92,32 +73,26 @@
                   :text="trans('servers.reinstall')"
               ></ServerControlButton>
             </div>
-          </n-card>
-        </div>
 
-        <div class="md:w-1/2">
-          <n-card
-              :title="trans('servers.process_status')"
-              class="mb-3"
-              header-class="g-card-header"
-              :segmented="{
-                          content: true,
-                          footer: 'soft'
-                        }"
-          >
+            <div class="ml-auto">
+              <GStatusBadge
+                  :status="serverOnline ? 'success' : 'error'"
+                  :text="serverOnline ? trans('servers.active') : trans('servers.inactive')"
+              />
+            </div>
+          </div>
+        </n-card>
+      </div>
+
+      <div v-if="canShowStats" class="mt-2">
+        <ServerStatisticsStrip :server-id="serverId" @open="statsModalShow = true" />
+      </div>
+
+      <div class="md:flex md:flex-wrap mt-2" v-show="serverQueryOnline">
+        <div class="md:w-full">
+          <n-card size="small" class="mb-3">
             <Loading v-if="loading"></Loading>
-            <ul v-if="!loading" class="flex flex-col pl-0 mb-0">
-              <li v-if="serverOnline" class="relative block py-3 px-6 -mb-px">
-                {{ trans('servers.status') }}: <span class="badge-green">{{ trans('servers.active') }}</span>
-              </li>
-              <li v-else class="relative block py-3 px-6 -mb-px">
-                {{ trans('servers.status') }}: <span class="badge-red">{{ trans('servers.inactive') }}</span>
-              </li>
-
-              <li class="relative block py-3 px-6 -mb-px">
-                {{ trans('servers.last_check') }}: {{ (new Date(server.last_process_check)).toLocaleString() }}
-              </li>
-            </ul>
+            <ServerStatus v-if="!loading" ref="serverStatusRef" :server-id="serverId"></ServerStatus>
           </n-card>
         </div>
       </div>
@@ -138,15 +113,6 @@
 
     </n-tab-pane>
 
-    <n-tab-pane name="statistics" v-if="serverStore.abilities['game-server-common'] && serverStore.canViewMetrics && serverOnline">
-      <template #tab>
-        <GIcon name="metrics" class="mr-1" />
-        {{ trans('servers.statistics') }}
-      </template>
-
-      <ServerStatistics :server-id="serverId" />
-    </n-tab-pane>
-
     <n-tab-pane name="rcon" v-if="rconTabPossible">
       <template #tab>
         <GIcon name="rcon" class="mr-1" />
@@ -155,8 +121,8 @@
 
       <div class="flex flex-wrap mt-2">
         <div class="md:w-full">
-          <div :class="'md:grid ' + (rconSupportedFeatures.playersManage ? 'md:grid-cols-2' : 'md:grid-cols-1')">
-            <div v-if="rconSupportedFeatures.playersManage" class="pr-8">
+          <div :class="'md:grid ' + (showRconConsolePanel && showRconPlayersPanel ? 'md:grid-cols-2' : 'md:grid-cols-1')">
+            <div v-if="showRconPlayersPanel" :class="showRconConsolePanel ? 'pr-8' : ''">
               <n-card
                   :title="trans('rcon.players_manage')"
                   class="mb-3"
@@ -170,7 +136,7 @@
               </n-card>
             </div>
 
-            <div>
+            <div v-if="showRconConsolePanel">
               <n-card
                   :title="trans('rcon.console')"
                   class="mb-3"
@@ -273,6 +239,13 @@
     </template>
 
   </n-tabs>
+
+  <ServerStatisticsModal
+      v-model:show="statsModalShow"
+      :server-id="serverId"
+      :server-name="server?.name"
+      :online="serverOnline"
+  />
 </template>
 
 <script setup>
@@ -280,6 +253,7 @@ import {computed, h, defineAsyncComponent, onMounted, ref, watch} from "vue";
 import {useRoute, useRouter} from "vue-router";
 import {storeToRefs} from "pinia";
 import ServerControlButton from "./servertabs/ServerControlButton.vue";
+import ServerStatisticsStrip from "./servertabs/ServerStatisticsStrip.vue";
 
 const ServerStatus = defineAsyncComponent(() =>
     import('./servertabs/ServerStatus.vue' /* webpackChunkName: "components/server" */)
@@ -297,8 +271,8 @@ const ServerSettings = defineAsyncComponent(() =>
     import('./servertabs/ServerSettings.vue' /* webpackChunkName: "components/server" */)
 )
 
-const ServerStatistics = defineAsyncComponent(() =>
-    import('./servertabs/ServerStatistics.vue' /* webpackChunkName: "components/server" */)
+const ServerStatisticsModal = defineAsyncComponent(() =>
+    import('./servertabs/ServerStatisticsModal.vue' /* webpackChunkName: "components/server" */)
 )
 
 const RconPlayers = defineAsyncComponent(() =>
@@ -333,6 +307,7 @@ const pluginsStore = usePluginsStore()
 providePluginContext()
 
 const activeTab = ref('control')
+const statsModalShow = ref(false)
 const initialHash = route.hash
 const initialTabName = (() => {
   if (!initialHash || initialHash === '#' || initialHash === '#control') return 'control'
@@ -394,14 +369,24 @@ const serverOnline = computed(() => {
   return Boolean(server.value?.online)
 })
 
+const canShowStats = computed(() => {
+  return serverStore.abilities['game-server-common'] && serverStore.canViewMetrics && serverOnline.value
+})
+
 const serverQueryOnline = computed(() => {
   return serverStatusRef.value?.status === 'online'
 })
 
+const showRconConsolePanel = computed(() => {
+  return serverRconStore.canUseRcon && rconSupportedFeatures.value.rcon
+})
+
+const showRconPlayersPanel = computed(() => {
+  return serverRconStore.canManageRconPlayers && rconSupportedFeatures.value.playersManage
+})
+
 const rconTabPossible = computed(() => {
-  return (rconSupportedFeatures.value.rcon || rconSupportedFeatures.value.playersManage) &&
-      serverRconStore.canUseRcon &&
-      serverOnline.value
+  return (showRconConsolePanel.value || showRconPlayersPanel.value) && serverOnline.value
 })
 
 const breadcrumbs = computed(() => {
@@ -455,7 +440,6 @@ function tabNameToHash(tabName) {
 
 function getAvailableTabNames() {
   const tabs = ['control']
-  if (serverStore.abilities['game-server-common'] && serverStore.canViewMetrics && serverOnline.value) tabs.push('statistics')
   if (rconTabPossible.value) tabs.push('rcon')
   if (serverStore.canManageFiles) tabs.push('files')
   if (serverStore.canManageTasks) tabs.push('schedules')
@@ -481,6 +465,14 @@ function onTabChange(tabName) {
 
 function setInitialTabFromHash() {
   const tabName = hashToTabName(route.hash)
+  if (tabName === 'statistics') {
+    activeTab.value = 'control'
+    if (canShowStats.value) {
+      statsModalShow.value = true
+      if (route.hash) router.replace({ ...route, hash: '' })
+    }
+    return
+  }
   if (isValidTabName(tabName)) {
     activeTab.value = tabName
     pendingPluginTab.value = ''
@@ -493,6 +485,14 @@ function setInitialTabFromHash() {
 
 watch(() => route.hash, (newHash) => {
   const tabName = hashToTabName(newHash)
+  if (tabName === 'statistics') {
+    activeTab.value = 'control'
+    if (canShowStats.value) {
+      statsModalShow.value = true
+      router.replace({ ...route, hash: '' })
+    }
+    return
+  }
   if (isValidTabName(tabName) && activeTab.value !== tabName) {
     activeTab.value = tabName
     pendingPluginTab.value = ''

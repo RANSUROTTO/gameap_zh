@@ -123,14 +123,29 @@ func (r *UserRepository) Save(ctx context.Context, user *domain.User) error {
 			user.Name,
 			user.CreatedAt,
 			user.UpdatedAt,
+			user.TwoFactorEnabled,
+			user.TwoFactorSecret,
+			user.TwoFactorRecoveryCodes,
+			user.TwoFactorLastUsedStep,
+			user.Metadata,
 		).
 		Suffix("ON DUPLICATE KEY UPDATE " +
+			// id=LAST_INSERT_ID(id) makes LastInsertId() return the existing
+			// row's id on the update path, so a login/email conflict on an
+			// ID-less insert still yields the real id (matching pg/sqlite
+			// RETURNING id) instead of 0.
+			"id=LAST_INSERT_ID(id)," +
 			"login=VALUES(login)," +
 			"email=VALUES(email)," +
 			"password=VALUES(password)," +
 			"remember_token=VALUES(remember_token)," +
 			"name=VALUES(name)," +
-			"updated_at=VALUES(updated_at)").
+			"updated_at=VALUES(updated_at)," +
+			"two_factor_enabled=VALUES(two_factor_enabled)," +
+			"two_factor_secret=VALUES(two_factor_secret)," +
+			"two_factor_recovery_codes=VALUES(two_factor_recovery_codes)," +
+			"two_factor_last_used_step=VALUES(two_factor_last_used_step)," +
+			"metadata=VALUES(metadata)").
 		PlaceholderFormat(sq.Question).
 		ToSql()
 	if err != nil {
@@ -186,6 +201,11 @@ func (r *UserRepository) scan(row base.Scanner) (*domain.User, error) {
 		&user.Name,
 		&user.CreatedAt,
 		&user.UpdatedAt,
+		&user.TwoFactorEnabled,
+		&user.TwoFactorSecret,
+		&user.TwoFactorRecoveryCodes,
+		&user.TwoFactorLastUsedStep,
+		&user.Metadata,
 	)
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed to scan row")
