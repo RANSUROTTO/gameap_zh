@@ -2006,6 +2006,7 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 	mfaEnrollmentScopeMiddleware := middlewares.NewMFAEnrollmentScopeMiddleware(
 		c.Responder(),
 		c.AuditLogger(),
+		c.Config().Auth.RequireMFAForAdmins,
 	)
 
 	for _, r := range routes {
