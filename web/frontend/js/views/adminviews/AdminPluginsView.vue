@@ -15,6 +15,7 @@
           :data="enrichedInstalledPlugins"
           :loading="loading"
           :pagination="installedPagination"
+          :scroll-x="isSmallScreen ? 460 : 920"
       >
         <template #loading>
           <Loading />
@@ -31,6 +32,7 @@
           :data="plugins"
           :loading="loading"
           :pagination="false"
+          :scroll-x="isSmallScreen ? 460 : 920"
       >
         <template #loading>
           <Loading />
@@ -393,7 +395,7 @@ const createStoreColumns = () => {
 const installedColumns = computed(() => {
   const cols = createInstalledColumns()
   if (isSmallScreen.value) {
-    return cols.filter(col => !['installed_version', 'download_count'].includes(col.key))
+    return cols.filter(col => !['installed_version', 'download_count', 'category', 'rating_avg'].includes(col.key))
   }
   return cols
 })
@@ -401,7 +403,7 @@ const installedColumns = computed(() => {
 const storeColumns = computed(() => {
   const cols = createStoreColumns()
   if (isSmallScreen.value) {
-    return cols.filter(col => !['latest_version', 'download_count'].includes(col.key))
+    return cols.filter(col => !['latest_version', 'download_count', 'category', 'rating_avg'].includes(col.key))
   }
   return cols
 })
