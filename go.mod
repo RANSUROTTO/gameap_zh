@@ -2,6 +2,8 @@ module github.com/gameap/gameap
 
 go 1.26
 
+toolchain go1.26.5
+
 require (
 	aidanwoods.dev/go-paseto v1.6.0
 	github.com/DATA-DOG/go-sqlmock v1.5.2
