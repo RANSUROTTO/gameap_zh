@@ -66,7 +66,7 @@
                 </template>
             </div>
             <div class="col-span-3 sm:col-span-2 flex items-center justify-end gap-1">
-                <n-tag v-if="phaseLabel(file)" :type="phaseTagType(file)" size="tiny" round>
+                <n-tag v-if="phaseLabel(file)" :type="phaseTagType(file)" size="tiny" round :title="errorTitle(file)">
                     {{ phaseLabel(file) }}
                 </n-tag>
             </div>
@@ -148,6 +148,12 @@ function phaseLabel(file) {
     if (file.phase === 'pending') return ''
 
     return phases[file.phase] || ''
+}
+
+function errorTitle(file) {
+    if (file.phase === 'error' && file.errorDetail) return file.errorDetail
+
+    return undefined
 }
 
 function phaseIcon(file) {

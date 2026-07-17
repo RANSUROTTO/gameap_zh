@@ -720,7 +720,14 @@ export const useFileManagerStore = defineStore('fm', () => {
                 messages.setFilePhase({ index: file.index, phase: 'done' })
             } catch (err) {
                 const code = err && err.code ? err.code : 'unknown'
-                messages.setFileError({ index: file.index, error: code })
+                if (code !== 'aborted') {
+                    console.error('[filemanager] upload failed:', filename, code, err)
+                }
+                messages.setFileError({
+                    index: file.index,
+                    error: code,
+                    detail: err && err.message ? err.message : null,
+                })
             }
         })
     }

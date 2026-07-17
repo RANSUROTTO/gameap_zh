@@ -226,6 +226,8 @@ const en = {
                 checksum_mismatch: 'Checksum mismatch',
                 server_error: 'Server error',
                 network: 'Network error',
+                hash_failed: 'File hashing failed',
+                proxy_limit: 'Rejected by proxy (request too large)',
                 dir_vs_file: 'Folder exists at this path',
                 unknown: 'Upload failed',
             },
