@@ -446,7 +446,14 @@
     tags:
       - FileManager
     summary: Rename file/directory
-    description: Renames a file or directory
+    description: |
+      Renames a file or directory. Both `oldName` and `newName` are paths
+      relative to the server root directory (e.g. `valve/addons` →
+      `valve/addons2`), so items inside subdirectories can be renamed. When
+      the `newName` parent directory differs from the `oldName` parent, the
+      item is moved there. Paths must not contain `..` components and must
+      not refer to the server root itself. Backslash separators are
+      normalized to forward slashes.
     operationId: renameFile
     parameters:
       - name: server
@@ -462,15 +469,28 @@
           schema:
             type: object
             properties:
-              old_path:
+              disk:
                 type: string
-                description: Current path
-              new_path:
+                description: Disk name, only `server` is supported
+                enum:
+                  - server
+              oldName:
                 type: string
-                description: New path
+                description: Current path relative to the server root directory
+              newName:
+                type: string
+                description: New path relative to the server root directory
+              type:
+                type: string
+                description: Type of the renamed item
+                enum:
+                  - file
+                  - dir
             required:
-              - old_path
-              - new_path
+              - disk
+              - oldName
+              - newName
+              - type
     responses:
       '200':
         description: File renamed
@@ -478,8 +498,26 @@
           application/json:
             schema:
               $ref: '../schemas/SuccessResponse.yaml'
+      '400':
+        description: Bad request (invalid path, unsupported disk, or invalid type)
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/ErrorResponse.yaml'
       '401':
         description: Unauthorized
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/ErrorResponse.yaml'
+      '403':
+        description: User does not have files permission for this server
+        content:
+          application/json:
+            schema:
+              $ref: '../schemas/ErrorResponse.yaml'
+      '404':
+        description: Server or node not found
         content:
           application/json:
             schema:
