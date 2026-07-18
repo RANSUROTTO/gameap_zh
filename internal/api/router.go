@@ -82,6 +82,7 @@ import (
 	"github.com/gameap/gameap/internal/api/pluginstore/getcategories"
 	"github.com/gameap/gameap/internal/api/pluginstore/getlabels"
 	"github.com/gameap/gameap/internal/api/pluginstore/getplugin"
+	"github.com/gameap/gameap/internal/api/pluginstore/getpluginicon"
 	"github.com/gameap/gameap/internal/api/pluginstore/getplugins"
 	"github.com/gameap/gameap/internal/api/pluginstore/getpluginversions"
 	"github.com/gameap/gameap/internal/api/pluginstore/installplugin"
@@ -1799,6 +1800,12 @@ func apiRoutes(c container, router *mux.Router) *mux.Router {
 			Method:    http.MethodGet,
 			Path:      "/api/plugin-store/plugins/{id}/versions",
 			Handler:   getpluginversions.NewHandler(c.PluginStoreService(), c.Responder()),
+			AdminOnly: true,
+		},
+		{
+			Method:    http.MethodGet,
+			Path:      "/api/plugin-store/plugins/{id}/icon",
+			Handler:   getpluginicon.NewHandler(c.PluginStoreService(), c.Responder()),
 			AdminOnly: true,
 		},
 		{

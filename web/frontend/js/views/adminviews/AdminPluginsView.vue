@@ -88,6 +88,7 @@ import { GBreadcrumbs, Loading, GIcon, GDataTable, GModal, GEmpty } from "@gamea
 import { computed, ref, onMounted, onUnmounted, h } from "vue"
 import { trans } from "@/i18n/i18n"
 import GButton from "@/components/GButton.vue"
+import PluginIcon from "@/components/plugins/PluginIcon.vue"
 import { usePluginStoreStore } from "@/store/pluginStore"
 import { errorNotification, notification } from "@/parts/dialogs"
 import {
@@ -190,9 +191,7 @@ const createInstalledColumns = () => {
           class: 'flex items-center gap-2 cursor-pointer hover:opacity-80',
           onClick: () => onShowDetails(row)
         }, [
-          row.icon_url
-              ? h('img', { src: row.icon_url, class: 'w-8 h-8 rounded', alt: row.name })
-              : h(GIcon, { name: 'plugin', class: 'text-2xl text-stone-400' }),
+          h(PluginIcon, { plugin: row }),
           h('div', { class: 'flex flex-col' }, [
             h('span', { class: 'font-medium text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap' }, row.name),
             badges.length > 0 ? h('div', { class: 'flex gap-1 mt-1 flex-wrap' }, badges) : null
@@ -284,9 +283,7 @@ const createStoreColumns = () => {
           class: 'flex items-center gap-2 cursor-pointer hover:opacity-80',
           onClick: () => onShowDetailsById(row.id)
         }, [
-          row.icon_url
-              ? h('img', { src: row.icon_url, class: 'w-8 h-8 rounded', alt: row.name })
-              : h(GIcon, { name: 'plugin', class: 'text-2xl text-stone-400' }),
+          h(PluginIcon, { plugin: row }),
           h('div', { class: 'flex flex-col' }, [
             h('div', { class: 'flex items-center gap-2' }, [
               h('span', { class: 'font-medium text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap' }, row.name),
