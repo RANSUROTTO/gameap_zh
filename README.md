@@ -19,12 +19,6 @@
 
 跟原版一样，没啥区别。
 
-```bash
-docker-compose up -d
-```
-
-访问 `http://localhost:8025` 就行。
-
 详细文档看原版：https://github.com/gameap/gameap
 
 ## 致谢
