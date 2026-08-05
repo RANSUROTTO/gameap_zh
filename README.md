@@ -1,20 +1,35 @@
-GameAP 中文汉化版
-基于 GameAP 的中文汉化版本。
+# GameAP 中文汉化版
 
-说明
+基于 [GameAP](https://github.com/gameap/gameap) 的中文汉化版本。
+
+## 说明
+
 这是 GameAP 游戏服务器管理面板的中文汉化版。原版支持英文和俄文，这个版本加了简体中文支持，默认语言改成中文。
 
-注意：这个版本我用的没啥问题那就不会更新
+**注意：这个版本我用的没问题就不会更新。** 如果你需要最新功能，建议用原版。
 
-汉化内容
-新增 zh-CN 语言文件
-前端界面默认使用中文
-保留英文和俄文，用户可以自己切换
-翻译不全的地方会回退英文，不会显示空白
-使用方式
+## 汉化内容
+
+- 新增 `zh-CN` 语言文件
+- 前端界面默认使用中文
+- 保留英文和俄文，用户可以自己切换
+- 翻译不全的地方会回退英文，不会显示空白
+
+## 使用方式
+
 跟原版一样，没啥区别。
 
+```bash
+docker-compose up -d
+```
+
+访问 `http://localhost:8025` 就行。
+
 详细文档看原版：https://github.com/gameap/gameap
+
+## 致谢
+
+感谢 GameAP 
 
 [![GameAP Logo](web/frontend/public/gameap_full.svg)](https://gameap.com)
 
