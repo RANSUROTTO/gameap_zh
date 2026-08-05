@@ -1,6 +1,6 @@
 <template>
   <n-config-provider
-      :locale="pageLanguage() === 'ru' ? ruRU : enUS"
+      :locale="locale"
       :theme="naiveTheme"
       :theme-overrides="naiveThemeOverrides"
   >
@@ -58,6 +58,7 @@ import {
   darkTheme,
   ruRU,
   enUS,
+  zhCN,
 } from "naive-ui"
 import {THEME_KEY} from "vue-echarts"
 import MainNavbar from "./components/MainNavbar.vue"
@@ -88,6 +89,13 @@ const daemonTaskStore = useDaemonTaskStore()
 const gameStore = useGameStore()
 const serverStore = useServerStore()
 const userStore = useUserStore()
+
+const locales = {
+  en: enUS,
+  ru: ruRU,
+  'zh-CN': zhCN,
+}
+const locale = locales[pageLanguage()] ?? enUS
 
 const user = computed(() => {
   return authStore.user

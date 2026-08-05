@@ -1,0 +1,21 @@
+schema_version: "1.0"
+exported_by: "Local GameAP Palworld template"
+game:
+  code: "palworld"
+  name: "Palworld / 幻兽帕鲁"
+  engine: "Unreal Engine"
+  engine_version: "5"
+  steam_app_id_windows: 2394010
+  metadata:
+    documentation: "https://docs.palworldgame.com/"
+    default_game_port: 8211
+    default_query_port: 27015
+    default_rcon_port: 25575
+mods:
+  - name: "官方原版服务端"
+    start_cmd_windows: "PalServer.exe -port={port} -players={maxplayers} -logformat=text"
+    vars:
+      - var: "maxplayers"
+        default: "32"
+        info: "最大同时在线玩家数（官方上限默认值为 32）"
+        admin_var: true

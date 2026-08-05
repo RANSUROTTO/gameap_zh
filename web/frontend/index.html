@@ -82,8 +82,11 @@
             }
 
             const lang = detectLanguage();
-            const supportedLangs = ['en', 'ru'];
-            const finalLang = supportedLangs.includes(lang) ? lang : 'en';
+            const supportedLangs = ['en', 'ru', 'zh-CN'];
+            const normalizedLang = typeof lang === 'string' && lang.toLowerCase().startsWith('zh')
+                ? 'zh-CN'
+                : lang;
+            const finalLang = supportedLangs.includes(normalizedLang) ? normalizedLang : 'en';
 
             // Set HTML lang attribute for consistency
             document.documentElement.lang = finalLang;

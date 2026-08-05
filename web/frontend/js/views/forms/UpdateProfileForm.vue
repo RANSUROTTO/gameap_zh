@@ -113,6 +113,10 @@ const languageOptions = [
     label: 'Русский',
     value: 'ru',
   },
+  {
+    label: '简体中文',
+    value: 'zh-CN',
+  },
 ]
 
 const rules = {

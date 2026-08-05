@@ -1,0 +1,40 @@
+services:
+  gameap:
+    image: gameap:zh-cn
+    build: null
+    ports:
+      - "127.0.0.1:31718:31718"
+    labels:
+      com.gameap.local.description: "GameAP Simplified Chinese local deployment"
+      com.gameap.local.secrets-file: "F:\\ServerCollection\\GameAP\\.env"
+      com.gameap.local.secret-keys: "ENCRYPTION_KEY,AUTH_SECRET,POSTGRES_PASSWORD,PALWORLD_ADMIN_PASSWORD"
+      com.gameap.local.secret-policy: "Values are intentionally excluded from Docker labels; read the protected .env file"
+      com.gameap.local.query-secrets-file: "docker inspect gameap --format {{ index .Config.Labels \"com.gameap.local.secrets-file\" }}"
+    environment:
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      PLUGIN_HTTP_ALLOWED_SCHEMES: http,https
+      PLUGIN_HTTP_ALLOWED_HOSTS: host.docker.internal
+      DATABASE_URL: postgres://gameap:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/gameap?sslmode=disable
+
+  postgres:
+    labels:
+      com.gameap.local.description: "GameAP PostgreSQL persistent database"
+      com.gameap.local.credentials-file: "F:\\ServerCollection\\GameAP\\.env"
+      com.gameap.local.password-key: "POSTGRES_PASSWORD"
+
+  redis:
+    labels:
+      com.gameap.local.description: "GameAP Redis persistent cache"
+
+volumes:
+  gameap-storage:
+    labels:
+      com.gameap.local.description: "GameAP application files and persistent state"
+  gameap-postgres-data:
+    labels:
+      com.gameap.local.description: "GameAP PostgreSQL persistent data"
+  gameap-redis-data:
+    labels:
+      com.gameap.local.description: "GameAP Redis persistent data"

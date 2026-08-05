@@ -4,6 +4,7 @@ import { get, eachRight, replace } from 'lodash-es';
 const pluralForms = {
     default: (n) => (n !== 1 ? 1 : 0),
     en: (n) => (n !== 1 ? 1 : 0),
+    'zh-CN': () => 0,
     ru: (n) =>
         n % 10 === 1 && n % 100 !== 11
             ? 0
@@ -69,10 +70,10 @@ const pageLanguage = () => {
 
 /**
  * Change the application language
- * @param {string} newLang - Language code ('en' or 'ru')
+ * @param {string} newLang - Language code ('en', 'ru', or 'zh-CN')
  */
 const changeLanguage = (newLang) => {
-    const supportedLangs = ['en', 'ru'];
+    const supportedLangs = ['en', 'ru', 'zh-CN'];
     if (!supportedLangs.includes(newLang)) {
         console.error('[i18n] Unsupported language:', newLang);
 
