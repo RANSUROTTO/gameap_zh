@@ -8,22 +8,38 @@ GameAP 游戏服务器管理面板的中文汉化版本。
 
 **注意：这个版本大概率不会跟进上游更新，基本就是一锤子买卖。** 如果你需要最新功能，建议用原版。
 
+## 下载
+
+从 Assets 下载 `gameap-zh-cn.tar`（Docker 镜像，约 22MB）。
+
+## 使用方式
+
+### 方式一：加载本地镜像
+
+```bash
+# 加载镜像
+docker load -i gameap-zh-cn.tar
+
+# 启动
+docker-compose up -d
+```
+
+### 方式二：直接用 docker-compose
+
+把 `docker-compose.local.yml` 放到 GameAP 目录，然后：
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.local.yml up -d
+```
+
+访问 `http://localhost:8025` 就行。
+
 ## 汉化内容
 
 - 新增简体中文语言文件 (`zh-CN`)
 - 前端界面默认使用中文
 - 保留英文和俄文，用户可以自己切换
 - 翻译不全的地方会回退英文，不会显示空白
-
-## 使用方式
-
-跟原版一样，Docker 部署最省事：
-
-```bash
-docker-compose up -d
-```
-
-访问 `http://localhost:8025` 就行。
 
 ## 本地部署配置
 
